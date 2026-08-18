@@ -1,10 +1,10 @@
-name: Ingestion Quotidienne Trains Européens
+name: Ingestion Hebdomadaire Trains Européens
 
 on:
   schedule:
-    # Exécution tous les jours à 4h00 UTC
-    - cron: '0 4 * * *'
-  workflow_dispatch: # Permet de déclencher l'ingestion manuellement
+    # Exécution tous les lundis à 4h00 UTC
+    - cron: '0 4 * * 1'
+  workflow_dispatch: # Permet de déclencher l'ingestion manuellement si besoin
 
 jobs:
   build-and-update:
@@ -33,6 +33,6 @@ jobs:
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add eu_trains.db
-        git commit -m "Auto-update: Mise à jour quotidienne de la base eu_trains.db" || exit 0
+        git add -f eu_trains.db
+        git commit -m "Auto-update: Mise à jour hebdomadaire de la base eu_trains.db" || exit 0
         git push
