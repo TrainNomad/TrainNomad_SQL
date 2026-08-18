@@ -134,7 +134,7 @@ def build_sqlite_gtfs():
             )
 
     create_indexes(conn)
-    conn.pragma_update("synchronous", "NORMAL")
+    conn.execute("PRAGMA synchronous = NORMAL;")
     conn.close()
     print(f"✅ Base SQLite générée avec succès : {DB_PATH}")
 
