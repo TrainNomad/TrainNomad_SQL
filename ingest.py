@@ -1,12 +1,13 @@
 from datetime import datetime, timedelta
 import io
+import json
 import os
 import sqlite3
 import zipfile
 import pandas as pd
 import requests
 
-# 1. Configuration des dates (Fenêtre de 90 jours)
+# Fenêtre glissante de 90 jours
 TODAY = datetime.now()
 DATE_MIN = (TODAY - timedelta(days=1)).strftime("%Y%m%d")
 DATE_MAX = (TODAY + timedelta(days=90)).strftime("%Y%m%d")
@@ -14,14 +15,20 @@ DATE_MAX = (TODAY + timedelta(days=90)).strftime("%Y%m%d")
 DB_FILE = "eu_trains.db"
 
 
+def time_to_minutes(time_str):
+    """Convertit HH:MM:SS en minutes depuis minuit."""
+    try:
+        parts = time_str.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        return 0
+
+
 def init_db(conn):
-    """Initialise la structure de la base de données SQLite."""
     cursor = conn.cursor()
     cursor.executescript(
         """
-        DROP TABLE IF EXISTS stops;
         DROP TABLE IF EXISTS trips;
-        DROP TABLE IF EXISTS stop_times;
         DROP TABLE IF EXISTS operators;
 
         CREATE TABLE operators (
@@ -29,30 +36,22 @@ def init_db(conn):
             name TEXT
         );
 
-        CREATE TABLE stops (
-            stop_id TEXT PRIMARY KEY,
-            stop_name TEXT,
-            stop_lat REAL,
-            stop_lon REAL,
-            operator_id TEXT
-        );
-
         CREATE TABLE trips (
-            trip_id TEXT PRIMARY KEY,
-            route_id TEXT,
-            service_id TEXT,
-            trip_headsign TEXT,
-            operator_id TEXT
-        );
-
-        CREATE TABLE stop_times (
-            trip_id TEXT,
-            arrival_time TEXT,
-            departure_time TEXT,
-            stop_id TEXT,
-            stop_sequence INTEGER,
+            operator_id TEXT,
             date TEXT,
-            operator_id TEXT
+            origin_name TEXT,
+            origin_parent_name TEXT,
+            destination_name TEXT,
+            destination_parent_name TEXT,
+            origin_lat REAL,
+            origin_lon REAL,
+            dest_lat REAL,
+            dest_lon REAL,
+            departure_time TEXT,
+            arrival_time TEXT,
+            dep_min INTEGER,
+            train_no TEXT,
+            train_type TEXT
         );
     """
     )
@@ -60,61 +59,54 @@ def init_db(conn):
 
 
 def process_gtfs(operator, conn):
-    """Télécharge, filtre et insère un flux GTFS dans la BDD."""
     op_id = operator["id"]
-    print(f"--- Traitement de l'opérateur : {operator['name']} ({op_id}) ---")
+    print(f"--- Traitement de : {operator['name']} ({op_id}) ---")
 
     try:
-        response = requests.get(operator["gtfs_url"], timeout=60)
+        response = requests.get(operator["gtfs_url"], timeout=90)
         response.raise_for_status()
         z = zipfile.ZipFile(io.BytesIO(response.content))
     except Exception as e:
-        print(f"Erreur lors du téléchargement pour {op_id}: {e}")
+        print(f"Erreur de téléchargement pour {op_id}: {e}")
         return
 
-    # A. Filtrage du calendrier (90 jours)
-    active_services = set()
-    service_dates_map = {}  # service_id -> list of dates
-
+    # A. Services actifs
+    service_dates_map = {}
     if "calendar_dates.txt" in z.namelist():
-        df_cal_dates = pd.read_csv(
-            z.open("calendar_dates.txt"), dtype=str, usecols=["service_id", "date", "exception_type"]
+        df_cal = pd.read_csv(
+            z.open("calendar_dates.txt"),
+            dtype=str,
+            usecols=["service_id", "date", "exception_type"],
         )
-        df_cal_dates = df_cal_dates[
-            (df_cal_dates["date"] >= DATE_MIN)
-            & (df_cal_dates["date"] <= DATE_MAX)
-            & (df_cal_dates["exception_type"] == "1")
+        df_cal = df_cal[
+            (df_cal["date"] >= DATE_MIN)
+            & (df_cal["date"] <= DATE_MAX)
+            & (df_cal["exception_type"] == "1")
         ]
+        for _, row in df_cal.iterrows():
+            service_dates_map.setdefault(row["service_id"], []).append(row["date"])
 
-        for _, row in df_cal_dates.iterrows():
-            s_id, d = row["service_id"], row["date"]
-            active_services.add(s_id)
-            service_dates_map.setdefault(s_id, []).append(d)
-
-    if not active_services:
-        print(f"Aucun service actif trouvé pour {op_id} dans la fenêtre de 90 jours.")
+    if not service_dates_map:
+        print(f"Aucun service actif pour {op_id}.")
         return
 
-    # B. Traitement des TRIPS
+    # B. Trips & Routes
     df_trips = pd.read_csv(
         z.open("trips.txt"),
         dtype=str,
         usecols=["trip_id", "route_id", "service_id", "trip_headsign"],
     )
-    df_trips = df_trips[df_trips["service_id"].isin(active_services)].copy()
-    df_trips["operator_id"] = op_id
+    df_trips = df_trips[df_trips["service_id"].isin(service_dates_map.keys())].copy()
 
-    valid_trips = set(df_trips["trip_id"])
-
-    # C. Traitement des STOPS
+    # C. Stops
     df_stops = pd.read_csv(
         z.open("stops.txt"),
         dtype={"stop_id": str, "stop_name": str, "stop_lat": float, "stop_lon": float},
         usecols=["stop_id", "stop_name", "stop_lat", "stop_lon"],
     )
-    df_stops["operator_id"] = op_id
+    stops_dict = df_stops.set_index("stop_id").to_dict(orient="index")
 
-    # D. Traitement des STOP_TIMES (Table la plus lourde)
+    # D. Stop Times
     df_st = pd.read_csv(
         z.open("stop_times.txt"),
         dtype={
@@ -126,64 +118,80 @@ def process_gtfs(operator, conn):
         },
         usecols=["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
     )
-    df_st = df_st[df_st["trip_id"].isin(valid_trips)].copy()
-
-    # Association trip_id -> dates via service_id
-    trip_to_service = dict(zip(df_trips["trip_id"], df_trips["service_id"]))
-
-    # Expansion des stop_times par date (uniquement les dates valides)
-    st_expanded = []
-    for row in df_st.itertuples(index=False):
-        srv_id = trip_to_service.get(row.trip_id)
-        if srv_id in service_dates_map:
-            for d in service_dates_map[srv_id]:
-                st_expanded.append(
-                    (
-                        row.trip_id,
-                        row.arrival_time,
-                        row.departure_time,
-                        row.stop_id,
-                        row.stop_sequence,
-                        d,
-                        op_id,
-                    )
-                )
-
-    # E. Insertion dans SQLite
-    cursor = conn.cursor()
-
-    # Insertion Opérateur
-    cursor.execute("INSERT OR REPLACE INTO operators VALUES (?, ?)", (op_id, operator["name"]))
-
-    # Insertion Stops
-    df_stops.to_sql("stops", conn, if_exists="append", index=False)
-
-    # Insertion Trips
-    df_trips.to_sql("trips", conn, if_exists="append", index=False)
-
-    # Insertion Stop_times
-    cursor.executemany(
-        """
-        INSERT INTO stop_times (trip_id, arrival_time, departure_time, stop_id, stop_sequence, date, operator_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
-        st_expanded,
+    df_st = df_st[df_st["trip_id"].isin(set(df_trips["trip_id"]))].sort_values(
+        ["trip_id", "stop_sequence"]
     )
 
+    # E. Agrégation Origine -> Destination par trajet
+    trips_grouped = df_st.groupby("trip_id")
+    rows_to_insert = []
+
+    trip_info = df_trips.set_index("trip_id").to_dict(orient="index")
+
+    for trip_id, group in trips_grouped:
+        if len(group) < 2:
+            continue
+
+        first_stop = group.iloc[0]
+        last_stop = group.iloc[-1]
+
+        orig_data = stops_dict.get(first_stop["stop_id"], {})
+        dest_data = stops_dict.get(last_stop["stop_id"], {})
+
+        if not orig_data or not dest_data:
+            continue
+
+        meta = trip_info.get(trip_id, {})
+        srv_id = meta.get("service_id")
+        headsign = meta.get("trip_headsign", "")
+
+        dates = service_dates_map.get(srv_id, [])
+        dep_time = first_stop["departure_time"]
+        arr_time = last_stop["arrival_time"]
+        dep_min = time_to_minutes(dep_time)
+
+        for d in dates:
+            # Conversion YYYYMMDD -> YYYY-MM-DD
+            formatted_date = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+            rows_to_insert.append(
+                (
+                    op_id,
+                    formatted_date,
+                    orig_data.get("stop_name"),
+                    orig_data.get("stop_name"),
+                    dest_data.get("stop_name"),
+                    dest_data.get("stop_name"),
+                    orig_data.get("stop_lat"),
+                    orig_data.get("stop_lon"),
+                    dest_data.get("stop_lat"),
+                    dest_data.get("stop_lon"),
+                    dep_time,
+                    arr_time,
+                    dep_min,
+                    headsign,
+                    "Train",
+                )
+            )
+
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO operators VALUES (?, ?)", (op_id, operator["name"]))
+    cursor.executemany(
+        """
+        INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+        rows_to_insert,
+    )
     conn.commit()
-    print(f"Succès pour {op_id} : {len(st_expanded)} lignes d'arrêts insérées.")
+    print(f"Succès pour {op_id} : {len(rows_to_insert)} trajets insérés.")
 
 
 def finalize_db(conn):
-    """Crée les index de performance et compacte le fichier BDD."""
-    print("--- Création des index SQL ---")
+    print("--- Création des index et compactage ---")
     cursor = conn.cursor()
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_st_date_stop ON stop_times(date, stop_id);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_st_trip ON stop_times(trip_id);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stops_op ON stops(operator_id);")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trips_search ON trips(date, origin_name, destination_name);"
+    )
     conn.commit()
-
-    print("--- Compactage de la base (VACUUM) ---")
     conn.execute("VACUUM;")
     conn.close()
 
@@ -192,14 +200,12 @@ def main():
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
 
-    # Liste des opérateurs (Exemple : à charger depuis operators.json si présent)
-    operators = [
-        {
-            "id": "sncf",
-            "name": "SNCF / TGV Inoui / Ouigo",
-            "gtfs_url": "https://eu.api.ovh.com/gtfs/sncf.zip",  # Adapter l'URL exacte
-        }
-    ]
+    if not os.path.exists("operators.json"):
+        print("Erreur : operators.json introuvable.")
+        return
+
+    with open("operators.json", "r", encoding="utf-8") as f:
+        operators = json.load(f)
 
     conn = sqlite3.connect(DB_FILE)
     init_db(conn)
@@ -208,7 +214,6 @@ def main():
         process_gtfs(op, conn)
 
     finalize_db(conn)
-    print(f"Base de données générée avec succès : {DB_FILE}")
 
 
 if __name__ == "__main__":
