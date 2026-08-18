@@ -1,3 +1,6 @@
+import gzip
+import os
+import shutil
 import sqlite3
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
@@ -17,9 +20,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = "gtfs_indexed.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db")
+GZ_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db.gz")
+
+def ensure_db_decompressed():
+    """Décompresse gtfs_indexed.db.gz si la base .db n'existe pas encore."""
+    if not os.path.exists(DB_PATH):
+        if not os.path.exists(GZ_PATH):
+            raise FileNotFoundError("Ni 'gtfs_indexed.db' ni 'gtfs_indexed.db.gz' n'ont été trouvés.")
+        print("📦 Décompression de gtfs_indexed.db.gz...")
+        with gzip.open(GZ_PATH, 'rb') as f_in:
+            with open(DB_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        print("✅ Base décompressée avec succès !")
 
 def get_db_connection():
+    ensure_db_decompressed()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -116,7 +133,6 @@ def search_all(
     try:
         date_clean = date.strip()
 
-        # 1. Trajets directs via JOIN relationnels GTFS
         query_direct = """
         SELECT 
             s1.stop_name AS orig,
@@ -171,7 +187,6 @@ def search_all(
             for d in direct_rows
         ]
 
-        # 2. Trajets avec correspondance
         query_connections = """
         SELECT 
             s1.stop_name AS orig,
@@ -257,7 +272,6 @@ def explore_destinations(
         date_clean = date.strip()
         best_journeys = {}
 
-        # 1. Reconstitution des destinations directes
         query_direct = """
         SELECT 
             s2.stop_id AS to_id,
