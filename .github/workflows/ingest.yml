@@ -1,12 +1,10 @@
-name: Ingestion Hebdomadaire Trains Européens
+name: Ingestion Hebdomadaire GTFS SNCF
 
 on:
   schedule:
-    - cron: '0 4 * * 1'
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    # Exécution chaque dimanche à 3h00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch: # Permet de déclencher l'ingestion manuellement
 
 jobs:
   build-and-update:
@@ -27,18 +25,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install pandas requests
 
-    - name: Exécuter l'ingestion
+    - name: Exécuter l'ingestion du fichier GTFS SNCF
       run: |
-        python ingest.py
+        python ingest_sncf_gtfs.py
 
-    - name: Compresser la base SQLite
-      run: |
-        gzip -f -9 eu_trains.db
-
-    - name: Commit et Push de la base SQLite compressée
+    - name: Commit et Push de la base de données mise à jour
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add -f eu_trains.db.gz
-        git commit -m "Auto-update: Base SQLite compressée" || exit 0
+        git add sncf_compact.db
+        git commit -m "Auto-update: Mise à jour hebdomadaire des trajets SNCF GTFS" || exit 0
         git push

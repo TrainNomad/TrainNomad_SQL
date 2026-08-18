@@ -1,220 +1,184 @@
-from datetime import datetime, timedelta
-import io
-import json
 import os
+import io
 import sqlite3
 import zipfile
+from datetime import datetime, timedelta
 import pandas as pd
 import requests
 
-# Fenêtre glissante de 90 jours
-TODAY = datetime.now()
-DATE_MIN = (TODAY - timedelta(days=1)).strftime("%Y%m%d")
-DATE_MAX = (TODAY + timedelta(days=90)).strftime("%Y%m%d")
+GTFS_URL = "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"
 
-DB_FILE = "eu_trains.db"
+def detect_train_type(route_long_name, route_short_name):
+    name = f"{route_long_name} {route_short_name}".upper()
+    if "OUIGO" in name:
+        return "OUIGO"
+    if "TER" in name:
+        return "TER"
+    if "INTERCITÉS" in name or "INTERCITES" in name or "IC" in name:
+        return "INTERCITÉS"
+    if "TGV" in name or "INOUI" in name:
+        return "TGV INOUI"
+    return "TRAIN"
 
-
-def time_to_minutes(time_str):
-    """Convertit HH:MM:SS en minutes depuis minuit."""
-    try:
-        parts = time_str.split(":")
-        return int(parts[0]) * 60 + int(parts[1])
-    except Exception:
+def time_to_minutes(t_str):
+    if not t_str or ':' not in str(t_str):
         return 0
+    parts = str(t_str).strip().split(':')
+    return int(parts[0]) * 60 + int(parts[1])
 
+# 1. Chargement et résolution des gares depuis stations.csv
+print("1. Chargement des gares...")
+df_stations = pd.read_csv('stations.csv', sep=';', low_memory=False)
+df_stations['name'] = df_stations['name'].fillna('Gare Inconnue')
+df_stations['latitude'] = pd.to_numeric(df_stations['latitude'], errors='coerce').fillna(0.0)
+df_stations['longitude'] = pd.to_numeric(df_stations['longitude'], errors='coerce').fillna(0.0)
 
-def init_db(conn):
-    cursor = conn.cursor()
-    cursor.executescript(
-        """
-        DROP TABLE IF EXISTS trips;
-        DROP TABLE IF EXISTS operators;
+id_to_name = df_stations.set_index('id')['name'].to_dict()
+id_to_parent_id = df_stations.set_index('id')['parent_station_id'].to_dict()
 
-        CREATE TABLE operators (
-            id TEXT PRIMARY KEY,
-            name TEXT
-        );
+def resolve_parent_id(s_id):
+    p_id = id_to_parent_id.get(s_id)
+    if pd.isna(p_id) or not p_id:
+        return int(s_id)
+    return int(p_id)
 
-        CREATE TABLE trips (
-            operator_id TEXT,
-            date TEXT,
-            origin_name TEXT,
-            origin_parent_name TEXT,
-            destination_name TEXT,
-            destination_parent_name TEXT,
-            origin_lat REAL,
-            origin_lon REAL,
-            dest_lat REAL,
-            dest_lon REAL,
-            departure_time TEXT,
-            arrival_time TEXT,
-            dep_min INTEGER,
-            train_no TEXT,
-            train_type TEXT
-        );
-    """
-    )
-    conn.commit()
+df_stations['parent_id'] = df_stations['id'].apply(resolve_parent_id)
+id_to_parent_id = df_stations.set_index('id')['parent_id'].to_dict()
+id_to_parent_name = {s_id: id_to_name.get(p_id, id_to_name.get(s_id)) for s_id, p_id in id_to_parent_id.items()}
+id_to_lat = df_stations.set_index('id')['latitude'].to_dict()
+id_to_lon = df_stations.set_index('id')['longitude'].to_dict()
 
+# Mapping UIC (SNCF) -> id stations.csv
+df_uic = df_stations.dropna(subset=['uic', 'id']).copy()
+uic_to_id = {}
+for _, row in df_uic.iterrows():
+    uic_str = str(int(row['uic'])) if str(row['uic']).replace('.','').isdigit() else str(row['uic']).strip()
+    uic_to_id[uic_str] = int(row['id'])
 
-def process_gtfs(operator, conn):
-    op_id = operator["id"]
-    print(f"--- Traitement de : {operator['name']} ({op_id}) ---")
+# 2. Téléchargement et extraction du GTFS
+print("2. Téléchargement du fichier GTFS SNCF...")
+r = requests.get(GTFS_URL, stream=True, timeout=120)
+r.raise_for_status()
 
-    try:
-        response = requests.get(operator["gtfs_url"], timeout=90)
-        response.raise_for_status()
-        z = zipfile.ZipFile(io.BytesIO(response.content))
-    except Exception as e:
-        print(f"Erreur de téléchargement pour {op_id}: {e}")
-        return
+z = zipfile.ZipFile(io.BytesIO(r.content))
 
-    # A. Services actifs
-    service_dates_map = {}
-    if "calendar_dates.txt" in z.namelist():
-        df_cal = pd.read_csv(
-            z.open("calendar_dates.txt"),
-            dtype=str,
-            usecols=["service_id", "date", "exception_type"],
-        )
-        df_cal = df_cal[
-            (df_cal["date"] >= DATE_MIN)
-            & (df_cal["date"] <= DATE_MAX)
-            & (df_cal["exception_type"] == "1")
-        ]
-        for _, row in df_cal.iterrows():
-            service_dates_map.setdefault(row["service_id"], []).append(row["date"])
+print("3. Parsing des fichiers GTFS...")
+routes = pd.read_csv(z.open('routes.txt'), dtype=str)
+trips = pd.read_csv(z.open('trips.txt'), dtype=str)
+stop_times = pd.read_csv(z.open('stop_times.txt'), dtype=str)
+stops = pd.read_csv(z.open('stops.txt'), dtype=str)
 
-    if not service_dates_map:
-        print(f"Aucun service actif pour {op_id}.")
-        return
+# Map stop_id GTFS -> Station ID local
+stops['clean_uic'] = stops['stop_id'].str.replace('StopPoint:OCETrainSE-', '').str.replace('StopPoint:OCENL-', '').str.extract(r'(\d+)')
+stops['station_id'] = stops['clean_uic'].map(uic_to_id)
+stop_id_to_station_id = stops.dropna(subset=['station_id']).set_index('stop_id')['station_id'].to_dict()
 
-    # B. Trips & Routes
-    df_trips = pd.read_csv(
-        z.open("trips.txt"),
-        dtype=str,
-        usecols=["trip_id", "route_id", "service_id", "trip_headsign"],
-    )
-    df_trips = df_trips[df_trips["service_id"].isin(service_dates_map.keys())].copy()
+# Calcul des dates de circulation via calendar_dates.txt
+calendar_dates = pd.read_csv(z.open('calendar_dates.txt'), dtype=str)
+# Format YYYYMMDD -> YYYY-MM-DD
+calendar_dates['date_formatted'] = pd.to_datetime(calendar_dates['date'], format='%Y%m%d').dt.strftime('%Y-%m-%d')
+service_to_dates = calendar_dates[calendar_dates['exception_type'] == '1'].groupby('service_id')['date_formatted'].apply(list).to_dict()
 
-    # C. Stops
-    df_stops = pd.read_csv(
-        z.open("stops.txt"),
-        dtype={"stop_id": str, "stop_name": str, "stop_lat": float, "stop_lon": float},
-        usecols=["stop_id", "stop_name", "stop_lat", "stop_lon"],
-    )
-    stops_dict = df_stops.set_index("stop_id").to_dict(orient="index")
+# Association routes -> trips
+route_type_map = routes.set_index('route_id').apply(lambda r: detect_train_type(r.get('route_long_name', ''), r.get('route_short_name', '')), axis=1).to_dict()
+trips['train_type'] = trips['route_id'].map(route_type_map)
 
-    # D. Stop Times
-    df_st = pd.read_csv(
-        z.open("stop_times.txt"),
-        dtype={
-            "trip_id": str,
-            "arrival_time": str,
-            "departure_time": str,
-            "stop_id": str,
-            "stop_sequence": int,
-        },
-        usecols=["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
-    )
-    df_st = df_st[df_st["trip_id"].isin(set(df_trips["trip_id"]))].sort_values(
-        ["trip_id", "stop_sequence"]
-    )
+# Association des horaires de départ/arrivée consécutifs par trip
+stop_times['station_id'] = stop_times['stop_id'].map(stop_id_to_station_id)
+stop_times = stop_times.dropna(subset=['station_id']).sort_values(['trip_id', 'stop_sequence'])
 
-    # E. Agrégation Origine -> Destination par trajet
-    trips_grouped = df_st.groupby("trip_id")
-    rows_to_insert = []
+stop_times['next_station_id'] = stop_times.groupby('trip_id')['station_id'].shift(-1)
+stop_times['next_arrival_time'] = stop_times.groupby('trip_id')['arrival_time'].shift(-1)
 
-    trip_info = df_trips.set_index("trip_id").to_dict(orient="index")
+# Tronçons directs (étape A -> étape B)
+legs = stop_times.dropna(subset=['next_station_id']).copy()
 
-    for trip_id, group in trips_grouped:
-        if len(group) < 2:
-            continue
+# Jointure avec trips pour avoir service_id et train_no
+legs = legs.merge(trips[['trip_id', 'service_id', 'trip_headsign', 'train_type']], on='trip_id', how='inner')
 
-        first_stop = group.iloc[0]
-        last_stop = group.iloc[-1]
+records = []
+print("4. Génération des trajets par date...")
+for _, row in legs.iterrows():
+    orig_id = int(row['station_id'])
+    dest_id = int(row['next_station_id'])
+    dates = service_to_dates.get(row['service_id'], [])
+    
+    dep_time = row['departure_time'][:5]
+    arr_time = row['next_arrival_time'][:5]
+    
+    dep_m = time_to_minutes(dep_time)
+    arr_m = time_to_minutes(arr_time)
 
-        orig_data = stops_dict.get(first_stop["stop_id"], {})
-        dest_data = stops_dict.get(last_stop["stop_id"], {})
+    for d in dates:
+        records.append({
+            'date': d,
+            'origin_id': orig_id,
+            'origin_parent_id': id_to_parent_id.get(orig_id, orig_id),
+            'origin_name': id_to_name.get(orig_id, 'Inconnue'),
+            'origin_parent_name': id_to_parent_name.get(orig_id, 'Inconnue'),
+            'origin_lat': id_to_lat.get(orig_id, 0.0),
+            'origin_lon': id_to_lon.get(orig_id, 0.0),
+            
+            'destination_id': dest_id,
+            'destination_parent_id': id_to_parent_id.get(dest_id, dest_id),
+            'destination_name': id_to_name.get(dest_id, 'Inconnue'),
+            'destination_parent_name': id_to_parent_name.get(dest_id, 'Inconnue'),
+            'dest_lat': id_to_lat.get(dest_id, 0.0),
+            'dest_lon': id_to_lon.get(dest_id, 0.0),
 
-        if not orig_data or not dest_data:
-            continue
+            'departure_time': dep_time,
+            'arrival_time': arr_time,
+            'dep_min': dep_m,
+            'arr_min': arr_m,
+            'train_no': row.get('trip_headsign', ''),
+            'train_type': row['train_type']
+        })
 
-        meta = trip_info.get(trip_id, {})
-        srv_id = meta.get("service_id")
-        headsign = meta.get("trip_headsign", "")
+df_trips = pd.DataFrame(records)
 
-        dates = service_dates_map.get(srv_id, [])
-        dep_time = first_stop["departure_time"]
-        arr_time = last_stop["arrival_time"]
-        dep_min = time_to_minutes(dep_time)
+# 5. Enregistrement SQLite
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+db_path = os.path.join(BASE_DIR, 'sncf_compact.db')
 
-        for d in dates:
-            # Conversion YYYYMMDD -> YYYY-MM-DD
-            formatted_date = f"{d[:4]}-{d[4:6]}-{d[6:]}"
-            rows_to_insert.append(
-                (
-                    op_id,
-                    formatted_date,
-                    orig_data.get("stop_name"),
-                    orig_data.get("stop_name"),
-                    dest_data.get("stop_name"),
-                    dest_data.get("stop_name"),
-                    orig_data.get("stop_lat"),
-                    orig_data.get("stop_lon"),
-                    dest_data.get("stop_lat"),
-                    dest_data.get("stop_lon"),
-                    dep_time,
-                    arr_time,
-                    dep_min,
-                    headsign,
-                    "Train",
-                )
-            )
+print(f"5. Écriture dans SQLite ({db_path})...")
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
 
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO operators VALUES (?, ?)", (op_id, operator["name"]))
-    cursor.executemany(
-        """
-        INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        rows_to_insert,
-    )
-    conn.commit()
-    print(f"Succès pour {op_id} : {len(rows_to_insert)} trajets insérés.")
+cursor.execute('PRAGMA journal_mode = WAL;')
+cursor.execute('PRAGMA synchronous = NORMAL;')
 
+cursor.execute('DROP TABLE IF EXISTS trips;')
+cursor.execute('''
+CREATE TABLE trips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    origin_id INTEGER NOT NULL,
+    origin_parent_id INTEGER NOT NULL,
+    origin_name TEXT NOT NULL,
+    origin_parent_name TEXT NOT NULL,
+    origin_lat REAL,
+    origin_lon REAL,
+    destination_id INTEGER NOT NULL,
+    destination_parent_id INTEGER NOT NULL,
+    destination_name TEXT NOT NULL,
+    destination_parent_name TEXT NOT NULL,
+    dest_lat REAL,
+    dest_lon REAL,
+    departure_time TEXT NOT NULL,
+    arrival_time TEXT NOT NULL,
+    dep_min INTEGER NOT NULL,
+    arr_min INTEGER NOT NULL,
+    train_no TEXT,
+    train_type TEXT NOT NULL
+);
+''')
 
-def finalize_db(conn):
-    print("--- Création des index et compactage ---")
-    cursor = conn.cursor()
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_trips_search ON trips(date, origin_name, destination_name);"
-    )
-    conn.commit()
-    conn.execute("VACUUM;")
-    conn.close()
+df_trips.to_sql('trips', conn, if_exists='append', index=False)
 
+print("6. Création des index composites...")
+cursor.execute('CREATE INDEX idx_search_direct ON trips(date, origin_parent_id, destination_parent_id, dep_min);')
+cursor.execute('CREATE INDEX idx_search_transfer ON trips(date, origin_parent_id, dep_min, arr_min);')
 
-def main():
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-
-    if not os.path.exists("operators.json"):
-        print("Erreur : operators.json introuvable.")
-        return
-
-    with open("operators.json", "r", encoding="utf-8") as f:
-        operators = json.load(f)
-
-    conn = sqlite3.connect(DB_FILE)
-    init_db(conn)
-
-    for op in operators:
-        process_gtfs(op, conn)
-
-    finalize_db(conn)
-
-
-if __name__ == "__main__":
-    main()
+conn.commit()
+conn.close()
+print("✅ Ingestion GTFS SNCF terminée !")
