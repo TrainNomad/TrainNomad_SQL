@@ -20,19 +20,16 @@ jobs:
         python-version: '3.13'
         cache: 'pip'
 
-    - name: Installer les dépendances
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas requests
+    - name: Exécuter l'ingestion
+      run: python ingest.py
 
-    - name: Exécuter l'ingestion des opérateurs européens
-      run: |
-        python ingest.py
+    - name: Compresser la base SQLite
+      run: gzip -f -9 eu_trains.db
 
-    - name: Commit et Push de la base SQLite mise à jour
+    - name: Commit et Push
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add -f eu_trains.db
-        git commit -m "Auto-update: Mise à jour hebdomadaire de la base eu_trains.db" || exit 0
+        git add -f eu_trains.db.gz
+        git commit -m "Auto-update: BDD SQLite compressée" || exit 0
         git push
