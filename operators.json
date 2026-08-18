@@ -1,0 +1,8 @@
+[
+  {
+    "id": "SNCF",
+    "name": "SNCF",
+    "gtfs_dir": "./gtfs/sncf",
+    "gtfs_url": "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip"
+  }
+]
