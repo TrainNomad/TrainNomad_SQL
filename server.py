@@ -81,8 +81,8 @@ def get_stations(q: str = Query(None, description="Recherche partielle du nom de
 
 @app.get("/search")
 def search_all(
-    origin: str = Query(..., description="Nom de la gare de départ (ex: 'Paris Gare de Lyon')"),
-    destination: str = Query(..., description="Nom de la gare d'arrivée (ex: 'Lyon Part Dieu')"),
+    origin: str = Query(..., description="Nom de la gare de départ"),
+    destination: str = Query(..., description="Nom de la gare d'arrivée"),
     date: str = Query(..., description="Date au format YYYY-MM-DD"),
 ):
     conn = get_db_connection()
@@ -148,7 +148,10 @@ def search_all(
             for d in direct_rows
         ]
 
-        # 2. Correspondances optimisées
+        # Récupération des numéros de trains directs pour filtrage
+        direct_train_numbers = {d["train1_no"] for d in direct_results if d["train1_no"]}
+
+        # 2. Correspondances optimisées (requête CTE séparée)
         query_connections = """
         WITH train1 AS (
             SELECT 
@@ -204,20 +207,23 @@ def search_all(
         FROM train1 t1
         JOIN train2 t2 ON t1.transfer_station = t2.transfer_station
         WHERE t2.dep_min2 >= (t1.arr_min1 + 15)
-          AND t2.dep_min2 <= (t1.arr_min1 + 120)
+          AND t2.dep_min2 <= (t1.arr_min1 + 90)
         ORDER BY t1.train1_dep ASC, t2.train2_arr ASC
         """
         cursor.execute(query_connections, (orig_label, date_clean, dest_label, date_clean))
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
-        # 3. Filtrage en mémoire : supprimer les correspondances sous-optimales et doublons
+        # 3. Filtrage strict anti-redondance
         valid_connections = []
-        seen_pairs = set()
+        seen_first_trains = set()
 
         for c in conn_rows:
-            # Clé unique pour éliminer les combinaisons de trains identiques
-            unique_key = (c["train1_no"], c["train2_no"], c["transfer_station_arr"])
-            if unique_key in seen_pairs:
+            # Règle A: Si ce train va DÉJÀ en direct à destination, inutile d'en faire une correspondance
+            if c["train1_no"] in direct_train_numbers:
+                continue
+
+            # Règle B: Un seul itinéraire conservé par train de départ (le plus rapide/premier arrivé)
+            if c["train1_no"] in seen_first_trains:
                 continue
 
             c["is_direct"] = False
@@ -225,11 +231,10 @@ def search_all(
             c["is_valid_layover"] = True
             
             valid_connections.append(c)
-            seen_pairs.add(unique_key)
+            seen_first_trains.add(c["train1_no"])
 
-        # Si un trajet direct existe à la même heure, on priorise le trajet direct
         all_results = direct_results + valid_connections
-        all_results.sort(key=lambda x: (x["train1_dep"], x["is_direct"] == False))
+        all_results.sort(key=lambda x: x["train1_dep"])
 
         conn.close()
         return {"count": len(all_results), "results": all_results[:20]}
