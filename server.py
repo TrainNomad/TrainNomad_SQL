@@ -7,9 +7,9 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
-    title="SNCF Multi-Transport API (Ultra Performante)",
-    description="API GTFS SQLite accélérée avec indexation dynamique, filtrage par IDs et déduplication.",
-    version="3.0.0",
+    title="SNCF Multi-Transport API",
+    description="API GTFS SQLite rapide : recherche fiable et déduplication intelligente.",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -25,7 +25,7 @@ DB_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db")
 GZ_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db.gz")
 
 def ensure_db_and_indexes():
-    """Décompresse la DB si nécessaire et crée des index de performance à la volée."""
+    """Décompresse la DB si besoin et crée les index SQLite pour accélérer les requêtes."""
     if not os.path.exists(DB_PATH):
         if not os.path.exists(GZ_PATH):
             raise FileNotFoundError("Base de données introuvable.")
@@ -34,13 +34,11 @@ def ensure_db_and_indexes():
             with open(DB_PATH, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
 
-    # Création des index indispensables pour accélérer les jointures
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.executescript("""
         CREATE INDEX IF NOT EXISTS idx_stops_name ON stops(stop_name);
         CREATE INDEX IF NOT EXISTS idx_st_stop_trip ON stop_times(stop_id, trip_id);
-        CREATE INDEX IF NOT EXISTS idx_st_trip_seq ON stop_times(trip_id, stop_sequence);
         CREATE INDEX IF NOT EXISTS idx_cd_date_serv ON calendar_dates(date, service_id, exception_type);
     """)
     conn.commit()
@@ -57,9 +55,9 @@ def get_db_connection():
 
 def deduplicate_and_filter_trips(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Filtre les trajets :
-    1. Donne la priorité aux trajets directs.
-    2. Pour un même horaire de départ, conserve uniquement l'option avec l'arrivée la plus rapide.
+    Conserve la meilleure option par horaire de départ :
+    - Priorité absolue aux trajets directs.
+    - Sinon, conserve l'option qui arrive le plus tôt.
     """
     best_routes_by_dep: Dict[str, Dict[str, Any]] = {}
 
@@ -90,13 +88,13 @@ def get_stations(q: str = Query(None, description="Recherche partielle du nom de
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    search_pattern = q.strip() + "%"
+    search_pattern = "%" + q.strip().upper() + "%"
 
     try:
         query_stations = """
-            SELECT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, clean_uic
+            SELECT DISTINCT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, clean_uic
             FROM stops 
-            WHERE stop_name LIKE ?
+            WHERE UPPER(stop_name) LIKE ?
             GROUP BY stop_name
             ORDER BY stop_name ASC
             LIMIT 15
@@ -132,72 +130,77 @@ def search_all(
         orig_label = origin.strip()
         dest_label = destination.strip()
 
-        # Résolution rapide des IDs de gares
-        cursor.execute("SELECT stop_id FROM stops WHERE stop_name = ?", (orig_label,))
-        orig_ids = [row["stop_id"] for row in cursor.fetchall()]
-        
-        cursor.execute("SELECT stop_id FROM stops WHERE stop_name = ?", (dest_label,))
-        dest_ids = [row["stop_id"] for row in cursor.fetchall()]
-
-        if not orig_ids or not dest_ids:
-            conn.close()
-            return {"count": 0, "results": []}
-
-        orig_ph = ",".join("?" for _ in orig_ids)
-        dest_ph = ",".join("?" for _ in dest_ids)
-
-        # 1. Trajets directs
-        query_direct = f"""
+        # 1. Requête des trajets directs
+        query_direct = """
         SELECT 
-            s1.stop_name AS orig, s2.stop_name AS dest,
+            s1.stop_name AS orig,
+            s2.stop_name AS dest,
             s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon,
             s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-            st1.departure_time AS train1_dep, st2.arrival_time AS train1_arr,
-            t.trip_headsign AS train1_no, t.train_type AS train1_type
+            st1.departure_time AS train1_dep,
+            st2.arrival_time AS train1_arr,
+            t.trip_headsign AS train1_no,
+            t.train_type AS train1_type,
+            st1.dep_min
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
         JOIN trips t ON st1.trip_id = t.trip_id
         JOIN calendar_dates cd ON t.service_id = cd.service_id
         JOIN stops s1 ON st1.stop_id = s1.stop_id
         JOIN stops s2 ON st2.stop_id = s2.stop_id
-        WHERE st1.stop_id IN ({orig_ph})
-          AND st2.stop_id IN ({dest_ph})
+        WHERE UPPER(s1.stop_name) = UPPER(?)
+          AND UPPER(s2.stop_name) = UPPER(?)
           AND cd.date = ?
           AND cd.exception_type = 1
         ORDER BY st1.dep_min ASC
         """
-        cursor.execute(query_direct, (*orig_ids, *dest_ids, date_clean))
+        cursor.execute(query_direct, (orig_label, dest_label, date_clean))
         direct_rows = cursor.fetchall()
 
         direct_results = [
             {
                 "is_direct": True,
-                "orig": d["orig"], "dest": d["dest"],
-                "orig_lat": d["orig_lat"], "orig_lon": d["orig_lon"],
-                "dest_lat": d["dest_lat"], "dest_lon": d["dest_lon"],
+                "orig": d["orig"],
+                "dest": d["dest"],
+                "orig_lat": d["orig_lat"],
+                "orig_lon": d["orig_lon"],
+                "dest_lat": d["dest_lat"],
+                "dest_lon": d["dest_lon"],
                 "date": date_clean,
-                "train1_no": d["train1_no"], "train1_type": d["train1_type"],
-                "train1_dep": d["train1_dep"], "train1_arr": d["train1_arr"],
-                "transfer_station_arr": None, "transfer_station_dep": None,
-                "train2_no": None, "train2_type": None,
-                "train2_dep": None, "train2_arr": None,
-                "layover_minutes": 0, "is_valid_layover": True,
+                "train1_no": d["train1_no"],
+                "train1_type": d["train1_type"],
+                "train1_dep": d["train1_dep"],
+                "train1_arr": d["train1_arr"],
+                "transfer_station_arr": None,
+                "transfer_station_dep": None,
+                "train2_no": None,
+                "train2_type": None,
+                "train2_dep": None,
+                "train2_arr": None,
+                "layover_minutes": 0,
+                "is_valid_layover": True,
             }
             for d in direct_rows
         ]
 
-        # 2. Trajets avec correspondance
-        query_connections = f"""
+        # 2. Requête des trajets avec correspondance
+        query_connections = """
         SELECT 
-            s1.stop_name AS orig, s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon,
+            s1.stop_name AS orig,
+            s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon,
             s_trans1.stop_name AS transfer_station_arr,
             s_trans1.stop_lat AS transfer_lat, s_trans1.stop_lon AS transfer_lon,
             s_trans2.stop_name AS transfer_station_dep,
-            s2.stop_name AS dest, s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-            t1.trip_headsign AS train1_no, t1.train_type AS train1_type,
-            st1_dep.departure_time AS train1_dep, st1_arr.arrival_time AS train1_arr,
-            t2.trip_headsign AS train2_no, t2.train_type AS train2_type,
-            st2_dep.departure_time AS train2_dep, st2_arr.arrival_time AS train2_arr,
+            s2.stop_name AS dest,
+            s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
+            t1.trip_headsign AS train1_no,
+            t1.train_type AS train1_type,
+            st1_dep.departure_time AS train1_dep,
+            st1_arr.arrival_time AS train1_arr,
+            t2.trip_headsign AS train2_no,
+            t2.train_type AS train2_type,
+            st2_dep.departure_time AS train2_dep,
+            st2_arr.arrival_time AS train2_arr,
             (st2_dep.dep_min - st1_arr.dep_min) AS layover_minutes
         FROM stop_times st1_dep
         JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
@@ -215,16 +218,15 @@ def search_all(
         JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
         JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
 
-        WHERE st1_dep.stop_id IN ({orig_ph})
-          AND st2_arr.stop_id IN ({dest_ph})
+        WHERE UPPER(s1.stop_name) = UPPER(?)
+          AND UPPER(s2.stop_name) = UPPER(?)
           AND cd1.date = ? AND cd1.exception_type = 1
           AND cd2.date = ? AND cd2.exception_type = 1
           AND st2_dep.dep_min >= (st1_arr.dep_min + 15)
-          AND st2_dep.dep_min <= (st1_arr.dep_min + 120)
+          AND st2_dep.dep_min <= (st1_arr.dep_min + 180)
         ORDER BY st1_dep.dep_min ASC
-        LIMIT 200
         """
-        cursor.execute(query_connections, (*orig_ids, *dest_ids, date_clean, date_clean))
+        cursor.execute(query_connections, (orig_label, dest_label, date_clean, date_clean))
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
         valid_connections = [
@@ -232,7 +234,7 @@ def search_all(
             for c in conn_rows
         ]
 
-        # 3. Fusion et filtrage
+        # 3. Fusion et filtrage des doublons
         raw_results = direct_results + valid_connections
         filtered_results = deduplicate_and_filter_trips(raw_results)
 
@@ -260,20 +262,12 @@ def explore_destinations(
         date_clean = date.strip()
         best_journeys = {}
 
-        cursor.execute("SELECT stop_id FROM stops WHERE stop_name = ?", (start_label,))
-        orig_ids = [row["stop_id"] for row in cursor.fetchall()]
-
-        if not orig_ids:
-            conn.close()
-            return {"journeys": [], "count": 0}
-
-        orig_ph = ",".join("?" for _ in orig_ids)
-
-        query_direct = f"""
+        query_direct = """
         SELECT 
             s2.stop_name AS to_name,
             s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-            st1.departure_time AS dep_str, st2.arrival_time AS arr_str,
+            st1.departure_time AS dep_str,
+            st2.arrival_time AS arr_str,
             st1.dep_min, st2.dep_min AS arr_min,
             t.trip_headsign AS train_no,
             COALESCE(NULLIF(t.train_type, 'TRAIN'), r.train_type) AS train_type
@@ -282,13 +276,15 @@ def explore_destinations(
         JOIN trips t ON st1.trip_id = t.trip_id
         LEFT JOIN routes r ON t.route_id = r.route_id
         JOIN calendar_dates cd ON t.service_id = cd.service_id
+        JOIN stops s1 ON st1.stop_id = s1.stop_id
         JOIN stops s2 ON st2.stop_id = s2.stop_id
-        WHERE st1.stop_id IN ({orig_ph})
+        WHERE UPPER(s1.stop_name) = UPPER(?)
           AND cd.date = ?
           AND cd.exception_type = 1
         ORDER BY st1.dep_min ASC
+        LIMIT 500
         """
-        cursor.execute(query_direct, (*orig_ids, date_clean))
+        cursor.execute(query_direct, (start_label, date_clean))
         
         for row in cursor.fetchall():
             dest_name = row["to_name"]
