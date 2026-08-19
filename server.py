@@ -15,32 +15,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CORRECTION ICI : Remplacer gtfs.db par gtfs_indexed.db ---
+# Résolution absolue du chemin du fichier DB
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db")
 
 
 def get_db_connection():
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Base introuvable : {DB_PATH}")
-
-    # Le mode "ro" empêche SQLite de créer un fichier vide par erreur
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+        raise HTTPException(
+            status_code=500,
+            detail=f"Base de données introuvable. Chemin cherché : {DB_PATH}",
+        )
+    try:
+        # Connexion standard à SQLite
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Échec de connexion SQLite : {str(e)}"
+        )
 
 
 @app.get("/health")
 def health_check():
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT 1")
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
         conn.close()
-        return {"status": "ok", "database": DB_PATH}
+        return {
+            "status": "ok",
+            "db_path": DB_PATH,
+            "file_exists": os.path.exists(DB_PATH),
+            "tables": tables,
+        }
     except Exception as e:
+        conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur base de données: {str(e)}"
+            status_code=500, detail=f"Erreur health check : {str(e)}"
         )
 
 
@@ -328,7 +342,7 @@ def search_all(
     except Exception as e:
         conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur lors de la recherche: {str(e)}"
+            status_code=500, detail=f"Erreur SQL/Execution: {str(e)}"
         )
 
 
