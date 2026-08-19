@@ -1,11 +1,17 @@
+import gzip
 import os
+import shutil
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="GTFS Rail Search API")
+app = FastAPI(
+    title="SNCF Multi-Transport API",
+    description="API optimisée GTFS SQLite par noms de gares et détection du type de train.",
+    version="2.1.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,32 +21,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Résolution absolue du chemin du fichier DB
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db")
+GZ_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db.gz")
+
+
+def ensure_db_decompressed():
+    """Vérifie la présence de la BDD et décompresse la version .gz au besoin."""
+    if not os.path.exists(DB_PATH):
+        if not os.path.exists(GZ_PATH):
+            raise FileNotFoundError(
+                f"Ni 'gtfs_indexed.db' ni 'gtfs_indexed.db.gz' n'ont été trouvés dans {BASE_DIR}."
+            )
+        print("📦 Décompression de gtfs_indexed.db.gz...")
+        with gzip.open(GZ_PATH, "rb") as f_in:
+            with open(DB_PATH, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        print("✅ Base décompressée avec succès !")
 
 
 def get_db_connection():
-    if not os.path.exists(DB_PATH):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Base de données introuvable. Chemin cherché : {DB_PATH}",
-        )
-    try:
-        # Connexion standard à SQLite
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Échec de connexion SQLite : {str(e)}"
-        )
+    ensure_db_decompressed()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA cache_size=-64000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+
+@app.on_event("startup")
+def startup_event():
+    ensure_db_decompressed()
 
 
 @app.get("/health")
 def health_check():
-    conn = get_db_connection()
+    """Endpoint de diagnostic."""
     try:
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = [row[0] for row in cursor.fetchall()]
@@ -48,107 +68,147 @@ def health_check():
         return {
             "status": "ok",
             "db_path": DB_PATH,
-            "file_exists": os.path.exists(DB_PATH),
+            "db_exists": os.path.exists(DB_PATH),
             "tables": tables,
         }
     except Exception as e:
-        conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur health check : {str(e)}"
+            status_code=500, detail=f"Erreur vérification BDD: {str(e)}"
         )
 
 
 @app.get("/stations")
 def get_stations(
     q: Optional[str] = Query(
-        None, description="Terme de recherche pour autocomplétion"
+        None, description="Recherche partielle du nom de gare"
     ),
-    limit: int = Query(20, description="Nombre maximum de gares à retourner"),
+    limit: int = Query(15, description="Limite de résultats"),
 ):
+    if not q or not q.strip():
+        return {"results": []}
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    try:
-        if q:
-            query = """
-            SELECT DISTINCT stop_name, stop_lat, stop_lon 
-            FROM stops 
-            WHERE UPPER(stop_name) LIKE UPPER(?) 
-            ORDER BY stop_name ASC 
-            LIMIT ?
-            """
-            cursor.execute(query, (f"%{q.strip()}%", limit))
-        else:
-            query = """
-            SELECT DISTINCT stop_name, stop_lat, stop_lon 
-            FROM stops 
-            ORDER BY stop_name ASC 
-            LIMIT ?
-            """
-            cursor.execute(query, (limit,))
+    search_pattern = "%" + q.strip().upper() + "%"
 
-        rows = cursor.fetchall()
-        conn.close()
-        return [
-            {"name": r["stop_name"], "lat": r["stop_lat"], "lon": r["stop_lon"]}
-            for r in rows
+    try:
+        query_stations = """
+            SELECT DISTINCT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, clean_uic
+            FROM stops 
+            WHERE UPPER(stop_name) LIKE ?
+            GROUP BY stop_name
+            ORDER BY stop_name ASC
+            LIMIT ?
+        """
+        cursor.execute(query_stations, (search_pattern, limit))
+        stations = [
+            {
+                "type": "station",
+                "label": row["stop_name"],
+                "uic": row["clean_uic"],
+                "lat": row["stop_lat"],
+                "lon": row["stop_lon"],
+            }
+            for row in cursor.fetchall()
         ]
+        conn.close()
+        return {"results": stations}
     except Exception as e:
         conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur gares: {str(e)}"
+            status_code=500, detail=f"Erreur autocomplétion: {str(e)}"
         )
 
 
 @app.get("/explorer")
 def explore_destinations(
-    origin: str = Query(..., description="Gare de départ"),
-    date: str = Query(..., description="Date au format YYYY-MM-DD"),
-    limit: int = Query(
-        15, description="Nombre de destinations directes à explorer"
+    from_station: Optional[str] = Query(
+        None, alias="from", description="Nom de la gare de départ"
     ),
+    origin: Optional[str] = Query(None, description="Alternative à 'from'"),
+    date: str = Query(..., description="Date au format YYYY-MM-DD"),
 ):
+    start_label = (from_station or origin or "").strip()
+    if not start_label:
+        raise HTTPException(
+            status_code=400, detail="Paramètre 'from' ou 'origin' requis"
+        )
+
     conn = get_db_connection()
     cursor = conn.cursor()
+
     try:
         date_clean = date.strip()
-        orig_label = origin.strip()
+        best_journeys = {}
 
-        query = """
-        SELECT DISTINCT 
-            s2.stop_name AS dest,
-            s2.stop_lat AS dest_lat,
-            s2.stop_lon AS dest_lon,
-            COUNT(DISTINCT t.trip_id) AS trip_count
+        query_direct = """
+        SELECT 
+            s2.stop_name AS to_name,
+            s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
+            st1.departure_time AS dep_str,
+            st2.arrival_time AS arr_str,
+            st1.dep_min, st2.dep_min AS arr_min,
+            t.trip_headsign AS train_no,
+            COALESCE(NULLIF(t.train_type, 'TRAIN'), r.train_type) AS train_type
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
         JOIN trips t ON st1.trip_id = t.trip_id
+        JOIN routes r ON t.route_id = r.route_id
         JOIN calendar_dates cd ON t.service_id = cd.service_id
         JOIN stops s1 ON st1.stop_id = s1.stop_id
         JOIN stops s2 ON st2.stop_id = s2.stop_id
         WHERE UPPER(s1.stop_name) = UPPER(?)
           AND cd.date = ?
           AND cd.exception_type = 1
-        GROUP BY s2.stop_name
-        ORDER BY trip_count DESC
-        LIMIT ?
+        ORDER BY st1.dep_min ASC
+        LIMIT 500
         """
-        cursor.execute(query, (orig_label, date_clean, limit))
-        rows = cursor.fetchall()
-        conn.close()
+        cursor.execute(query_direct, (start_label, date_clean))
 
-        return [
-            {
-                "destination": r["dest"],
-                "lat": r["dest_lat"],
-                "lon": r["dest_lon"],
-                "trains_count": r["trip_count"],
+        for row in cursor.fetchall():
+            dest_name = row["to_name"]
+            duration_min = row["arr_min"] - row["dep_min"]
+            if duration_min < 0:
+                duration_min += 24 * 60
+
+            journey = {
+                "dest_name": dest_name,
+                "dest_lat": row["dest_lat"],
+                "dest_lon": row["dest_lon"],
+                "duration": duration_min,
+                "dep_str": row["dep_str"],
+                "arr_str": row["arr_str"],
+                "transfers": 0,
+                "legs": [
+                    {
+                        "from_name": start_label,
+                        "to_name": dest_name,
+                        "dep_str": row["dep_str"],
+                        "arr_str": row["arr_str"],
+                        "train_no": row["train_no"],
+                        "train_type": row["train_type"],
+                        "lat": row["dest_lat"],
+                        "lon": row["dest_lon"],
+                    }
+                ],
             }
-            for r in rows
-        ]
+
+            if (
+                dest_name not in best_journeys
+                or duration_min < best_journeys[dest_name]["duration"]
+            ):
+                best_journeys[dest_name] = journey
+
+        journeys = list(best_journeys.values())
+        journeys.sort(key=lambda x: (x["transfers"], x["duration"]))
+
+        conn.close()
+        return {"journeys": journeys, "count": len(journeys)}
+
     except Exception as e:
         conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur exploration: {str(e)}"
+            status_code=500, detail=f"Erreur explorer: {str(e)}"
         )
 
 
@@ -170,10 +230,11 @@ def search_all(
         orig_label = origin.strip()
         dest_label = destination.strip()
 
+        # Calcul de l'heure de filtrage en minutes depuis minuit
         time_parts = list(map(int, departure_time.split(":")))
         start_min = time_parts[0] * 60 + time_parts[1]
 
-        # 1. Trajets Directs
+        # 1. Trajets directs
         query_direct = """
         SELECT DISTINCT
             s1.stop_name AS orig, s2.stop_name AS dest,
@@ -299,6 +360,7 @@ def search_all(
         )
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
+        # 3. Filtrage anti-redondance
         valid_connections = []
         seen_first_trains = set()
 
@@ -319,6 +381,7 @@ def search_all(
 
         page_results = combined[:limit]
 
+        # Calcul du curseur pour pagination
         next_cursor = None
         if len(combined) > limit:
             last_dep = page_results[-1]["train1_dep"]
@@ -332,7 +395,6 @@ def search_all(
             r.pop("dep_min", None)
 
         conn.close()
-
         return {
             "count": len(page_results),
             "next_cursor": next_cursor,
@@ -342,7 +404,7 @@ def search_all(
     except Exception as e:
         conn.close()
         raise HTTPException(
-            status_code=500, detail=f"Erreur SQL/Execution: {str(e)}"
+            status_code=500, detail=f"Erreur recherche: {str(e)}"
         )
 
 
