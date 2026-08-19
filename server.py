@@ -93,9 +93,9 @@ def search_all(
         orig_label = origin.strip()
         dest_label = destination.strip()
 
-        # 1. Trajets directs basés sur les NOMS de gares (stop_name)
+        # 1. Trajets directs
         query_direct = """
-        SELECT 
+        SELECT DISTINCT
             s1.stop_name AS orig,
             s2.stop_name AS dest,
             s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon,
@@ -117,7 +117,7 @@ def search_all(
           AND cd.date = ?
           AND cd.exception_type = 1
         ORDER BY st1.dep_min ASC
-        LIMIT 50
+        LIMIT 30
         """
         cursor.execute(query_direct, (orig_label, dest_label, date_clean))
         direct_rows = cursor.fetchall()
@@ -148,69 +148,91 @@ def search_all(
             for d in direct_rows
         ]
 
-        # 2. Trajets avec correspondance basés sur les NOMS de gares
+        # 2. Correspondances optimisées
         query_connections = """
+        WITH train1 AS (
+            SELECT 
+                t1.trip_headsign AS train1_no,
+                COALESCE(NULLIF(t1.train_type, 'TRAIN'), r1.train_type) AS train1_type,
+                st1_dep.departure_time AS train1_dep,
+                st1_arr.arrival_time AS train1_arr,
+                st1_arr.dep_min AS arr_min1,
+                s_trans1.stop_name AS transfer_station,
+                s_trans1.stop_lat AS transfer_lat, 
+                s_trans1.stop_lon AS transfer_lon,
+                s1.stop_name AS orig, s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon
+            FROM stop_times st1_dep
+            JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
+            JOIN trips t1 ON st1_dep.trip_id = t1.trip_id
+            JOIN routes r1 ON t1.route_id = r1.route_id
+            JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
+            JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
+            JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
+            WHERE UPPER(s1.stop_name) = UPPER(?)
+              AND cd1.date = ? 
+              AND cd1.exception_type = 1
+        ),
+        train2 AS (
+            SELECT 
+                t2.trip_headsign AS train2_no,
+                COALESCE(NULLIF(t2.train_type, 'TRAIN'), r2.train_type) AS train2_type,
+                st2_dep.departure_time AS train2_dep,
+                st2_arr.arrival_time AS train2_arr,
+                st2_dep.dep_min AS dep_min2,
+                s_trans2.stop_name AS transfer_station,
+                s2.stop_name AS dest, s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon
+            FROM stop_times st2_dep
+            JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
+            JOIN trips t2 ON st2_dep.trip_id = t2.trip_id
+            JOIN routes r2 ON t2.route_id = r2.route_id
+            JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
+            JOIN stops s_trans2 ON st2_dep.stop_id = s_trans2.stop_id
+            JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
+            WHERE UPPER(s2.stop_name) = UPPER(?)
+              AND cd2.date = ? 
+              AND cd2.exception_type = 1
+        )
         SELECT 
-            s1.stop_name AS orig,
-            s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon,
-            s_trans1.stop_name AS transfer_station_arr,
-            s_trans1.stop_lat AS transfer_lat, s_trans1.stop_lon AS transfer_lon,
-            s_trans2.stop_name AS transfer_station_dep,
-            s2.stop_name AS dest,
-            s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-            t1.trip_headsign AS train1_no,
-            COALESCE(NULLIF(t1.train_type, 'TRAIN'), r1.train_type) AS train1_type,
-            st1_dep.departure_time AS train1_dep,
-            st1_arr.arrival_time AS train1_arr,
-            t2.trip_headsign AS train2_no,
-            COALESCE(NULLIF(t2.train_type, 'TRAIN'), r2.train_type) AS train2_type,
-            st2_dep.departure_time AS train2_dep,
-            st2_arr.arrival_time AS train2_arr,
-            (st2_dep.dep_min - st1_arr.dep_min) AS layover_minutes
-        FROM stop_times st1_dep
-        JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
-        JOIN trips t1 ON st1_dep.trip_id = t1.trip_id
-        JOIN routes r1 ON t1.route_id = r1.route_id
-        JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
-
-        JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
-        JOIN stops s_trans2 ON s_trans1.stop_name = s_trans2.stop_name
-        JOIN stop_times st2_dep ON s_trans2.stop_id = st2_dep.stop_id
-
-        JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
-        JOIN trips t2 ON st2_dep.trip_id = t2.trip_id
-        JOIN routes r2 ON t2.route_id = r2.route_id
-        JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
-
-        JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
-        JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
-
-        WHERE UPPER(s1.stop_name) = UPPER(?)
-          AND UPPER(s2.stop_name) = UPPER(?)
-          AND cd1.date = ? AND cd1.exception_type = 1
-          AND cd2.date = ? AND cd2.exception_type = 1
-          AND st2_dep.dep_min >= (st1_arr.dep_min + 15)
-          AND st2_dep.dep_min <= (st1_arr.dep_min + 180)
-        ORDER BY st1_dep.dep_min ASC
-        LIMIT 100
+            t1.orig, t1.orig_lat, t1.orig_lon,
+            t1.transfer_station AS transfer_station_arr,
+            t1.transfer_lat, t1.transfer_lon,
+            t1.transfer_station AS transfer_station_dep,
+            t2.dest, t2.dest_lat, t2.dest_lon,
+            t1.train1_no, t1.train1_type, t1.train1_dep, t1.train1_arr,
+            t2.train2_no, t2.train2_type, t2.train2_dep, t2.train2_arr,
+            (t2.dep_min2 - t1.arr_min1) AS layover_minutes
+        FROM train1 t1
+        JOIN train2 t2 ON t1.transfer_station = t2.transfer_station
+        WHERE t2.dep_min2 >= (t1.arr_min1 + 15)
+          AND t2.dep_min2 <= (t1.arr_min1 + 120)
+        ORDER BY t1.train1_dep ASC, t2.train2_arr ASC
         """
-        cursor.execute(query_connections, (orig_label, dest_label, date_clean, date_clean))
+        cursor.execute(query_connections, (orig_label, date_clean, dest_label, date_clean))
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
+        # 3. Filtrage en mémoire : supprimer les correspondances sous-optimales et doublons
         valid_connections = []
+        seen_pairs = set()
+
         for c in conn_rows:
+            # Clé unique pour éliminer les combinaisons de trains identiques
+            unique_key = (c["train1_no"], c["train2_no"], c["transfer_station_arr"])
+            if unique_key in seen_pairs:
+                continue
+
             c["is_direct"] = False
             c["date"] = date_clean
-            layover = c["layover_minutes"]
-            c["is_valid_layover"] = (15 <= layover <= 180)
-            if c["is_valid_layover"]:
-                valid_connections.append(c)
+            c["is_valid_layover"] = True
+            
+            valid_connections.append(c)
+            seen_pairs.add(unique_key)
 
+        # Si un trajet direct existe à la même heure, on priorise le trajet direct
         all_results = direct_results + valid_connections
-        all_results.sort(key=lambda x: x["train1_dep"])
+        all_results.sort(key=lambda x: (x["train1_dep"], x["is_direct"] == False))
 
         conn.close()
-        return {"count": len(all_results), "results": all_results[:30]}
+        return {"count": len(all_results), "results": all_results[:20]}
 
     except Exception as e:
         conn.close()
