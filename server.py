@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
@@ -14,24 +15,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = "gtfs.db"
+# --- CORRECTION ICI : Remplacer gtfs.db par gtfs_indexed.db ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "gtfs_indexed.db")
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"Base introuvable : {DB_PATH}")
+
+    # Le mode "ro" empêche SQLite de créer un fichier vide par erreur
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 @app.get("/health")
 def health_check():
-    """Vérification de l'état de l'API et de l'accès à la base de données."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         conn.close()
-        return {"status": "ok", "database": "connected"}
+        return {"status": "ok", "database": DB_PATH}
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Erreur base de données: {str(e)}"
@@ -45,7 +51,6 @@ def get_stations(
     ),
     limit: int = Query(20, description="Nombre maximum de gares à retourner"),
 ):
-    """Autocomplétion des gares pour le Front-End."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -84,9 +89,10 @@ def get_stations(
 def explore_destinations(
     origin: str = Query(..., description="Gare de départ"),
     date: str = Query(..., description="Date au format YYYY-MM-DD"),
-    limit: int = Query(15, description="Nombre de destinations directes à explorer"),
+    limit: int = Query(
+        15, description="Nombre de destinations directes à explorer"
+    ),
 ):
-    """Découverte des destinations directes accessibles depuis une gare donnée."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -142,7 +148,6 @@ def search_all(
     ),
     limit: int = Query(6, description="Nombre de trajets à retourner"),
 ):
-    """Recherche principale de trajets avec pagination et dédoublonnage."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -216,7 +221,7 @@ def search_all(
             d["train1_no"] for d in direct_results if d["train1_no"]
         }
 
-        # 2. Correspondances optimisées (CTE)
+        # 2. Correspondances
         query_connections = """
         WITH train1 AS (
             SELECT 
@@ -280,7 +285,6 @@ def search_all(
         )
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
-        # 3. Filtrage strict
         valid_connections = []
         seen_first_trains = set()
 
