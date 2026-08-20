@@ -44,7 +44,7 @@ def get_db_connection():
     ensure_db_decompressed()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    # conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA cache_size=-64000;")
     conn.execute("PRAGMA temp_store=MEMORY;")
