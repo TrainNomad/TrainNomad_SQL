@@ -46,6 +46,33 @@ def detect_transport_type(stop_id_str: str, available_types: list) -> str:
     if "TER" in val or "TRAIN TER" in val:
         return "Train TER"
         
+    # Retourne la première option de 'transport_types' définis dans operators.json si aucun pattern ne match
+    return available_types[0] if available_types else "Eurostar"
+    """Analyse la chaîne stop_id pour identifier le type de transport parmi les types de l'opérateur."""
+    val = str(stop_id_str).upper()
+    
+    # Vérification ciblée basée sur la chaîne stop_id
+    if "CAR TER" in val:
+        return "Car TER"
+    if "CAR À RÉSERVATION" in val or "CAR A RESERVATION" in val:
+        return "Car à réservation"
+    if "EUROSTAR" in val:
+        return "Eurostar"
+    if "ICE" in val:
+        return "ICE"
+    if "INTERCITÉS" in val or "INTERCITES" in val:
+        return "INTERCITES"
+    if "LYRIA" in val:
+        return "Lyria"
+    if "OUIGO" in val:
+        return "OUIGO"
+    if "TGV INOUI" in val or "INOUI" in val or "TGV" in val:
+        return "TGV INOUI"
+    if "TRAMTRAIN" in val or "TRAM TRAIN" in val:
+        return "TramTrain"
+    if "TER" in val or "TRAIN TER" in val:
+        return "Train TER"
+        
     return available_types[0] if available_types else "Train TER"
 
 def init_db(conn):
