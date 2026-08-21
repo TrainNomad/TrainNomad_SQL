@@ -16,7 +16,7 @@ jobs:
 
     - name: Télécharger et décompresser la base GTFS
       run: |
-        curl -L "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/harmonized_gtfs.db.gz" | gunzip > gtfs_indexed.db
+        curl -L "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/gtfs_indexed.db.gz" | gunzip > gtfs_indexed.db
 
     - name: Commit et Push du fichier gtfs_indexed.db
       run: |
