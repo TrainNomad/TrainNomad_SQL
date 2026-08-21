@@ -42,10 +42,8 @@ def ensure_db_decompressed():
 
 def get_db_connection():
     ensure_db_decompressed()
-    # mode=ro garantit qu'aucun verrou d'écriture ne sera posé lors des requêtes SELECT
     conn = sqlite3.connect("file:" + DB_PATH + "?mode=ro", uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    # Supprimez les PRAGMA d'écriture qui verrouillent le fichier !
     return conn
 
 
@@ -90,8 +88,9 @@ def get_stations(
     search_pattern = "%" + q.strip().upper() + "%"
 
     try:
+        # Remplacement de clean_uic par uic
         query_stations = """
-            SELECT DISTINCT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, clean_uic
+            SELECT DISTINCT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, uic
             FROM stops 
             WHERE UPPER(stop_name) LIKE ?
             GROUP BY stop_name
@@ -103,7 +102,7 @@ def get_stations(
             {
                 "type": "station",
                 "label": row["stop_name"],
-                "uic": row["clean_uic"],
+                "uic": row["uic"],
                 "lat": row["stop_lat"],
                 "lon": row["stop_lon"],
             }
@@ -147,7 +146,7 @@ def explore_destinations(
             st2.arrival_time AS arr_str,
             st1.dep_min, st2.dep_min AS arr_min,
             t.trip_headsign AS train_no,
-            COALESCE(NULLIF(t.train_type, 'TRAIN'), r.train_type) AS train_type
+            COALESCE(NULLIF(r.train_type, 'TRAIN'), 'Train SNCF') AS train_type
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
         JOIN trips t ON st1.trip_id = t.trip_id
@@ -228,7 +227,6 @@ def search_all(
         orig_label = origin.strip()
         dest_label = destination.strip()
 
-        # Calcul de l'heure de filtrage en minutes depuis minuit
         time_parts = list(map(int, departure_time.split(":")))
         start_min = time_parts[0] * 60 + time_parts[1]
 
@@ -240,7 +238,7 @@ def search_all(
             s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
             st1.departure_time AS train1_dep, st2.arrival_time AS train1_arr,
             t.trip_headsign AS train1_no,
-            COALESCE(NULLIF(t.train_type, 'TRAIN'), r.train_type) AS train1_type,
+            COALESCE(NULLIF(r.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
             st1.dep_min
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
@@ -299,7 +297,7 @@ def search_all(
         WITH train1 AS (
             SELECT 
                 t1.trip_headsign AS train1_no,
-                COALESCE(NULLIF(t1.train_type, 'TRAIN'), r1.train_type) AS train1_type,
+                COALESCE(NULLIF(r1.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
                 st1_dep.departure_time AS train1_dep, st1_arr.arrival_time AS train1_arr,
                 st1_arr.dep_min AS arr_min1, st1_dep.dep_min AS dep_min1,
                 s_trans1.stop_name AS transfer_station, s_trans1.stop_lat AS transfer_lat, s_trans1.stop_lon AS transfer_lon,
@@ -321,7 +319,7 @@ def search_all(
         train2 AS (
             SELECT 
                 t2.trip_headsign AS train2_no,
-                COALESCE(NULLIF(t2.train_type, 'TRAIN'), r2.train_type) AS train2_type,
+                COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
                 st2_dep.departure_time AS train2_dep, st2_arr.arrival_time AS train2_arr,
                 st2_dep.dep_min AS dep_min2,
                 s_trans2.stop_name AS transfer_station,
@@ -379,7 +377,6 @@ def search_all(
 
         page_results = combined[:limit]
 
-        # Calcul du curseur pour pagination
         next_cursor = None
         if len(combined) > limit:
             last_dep = page_results[-1]["train1_dep"]
