@@ -1,3 +1,2 @@
 *.db
-!gtfs_indexed.db.gz
 __pycache__/
