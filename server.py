@@ -9,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="SNCF Multi-Transport API",
-    description="API optimisée GTFS SQLite par noms de gares et détection du type de train.",
-    version="2.1.0",
+    description="API optimisée GTFS SQLite avec gestion des correspondances multi-gares par métropole.",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -76,7 +76,7 @@ def health_check():
 @app.get("/stations")
 def get_stations(
     q: Optional[str] = Query(
-        None, description="Recherche partielle du nom de gare"
+        None, description="Recherche partielle du nom de gare ou de ville"
     ),
     limit: int = Query(15, description="Limite de résultats"),
 ):
@@ -88,20 +88,22 @@ def get_stations(
     search_pattern = "%" + q.strip().upper() + "%"
 
     try:
-        # Remplacement de clean_uic par uic
+        # Recherche prioritaire par nom de gare ou nom de ville/parent
         query_stations = """
-            SELECT DISTINCT stop_name, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, uic
+            SELECT DISTINCT stop_name, parent_name, country, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, uic
             FROM stops 
-            WHERE UPPER(stop_name) LIKE ?
+            WHERE UPPER(stop_name) LIKE ? OR UPPER(parent_name) LIKE ?
             GROUP BY stop_name
             ORDER BY stop_name ASC
             LIMIT ?
         """
-        cursor.execute(query_stations, (search_pattern, limit))
+        cursor.execute(query_stations, (search_pattern, search_pattern, limit))
         stations = [
             {
                 "type": "station",
                 "label": row["stop_name"],
+                "parent_name": row["parent_name"],
+                "country": row["country"],
                 "uic": row["uic"],
                 "lat": row["stop_lat"],
                 "lon": row["stop_lon"],
@@ -138,6 +140,7 @@ def explore_destinations(
         date_clean = date.strip()
         best_journeys = {}
 
+        # Matching flexible : correspond au nom de gare OU au nom parent
         query_direct = """
         SELECT 
             s2.stop_name AS to_name,
@@ -154,13 +157,13 @@ def explore_destinations(
         JOIN calendar_dates cd ON t.service_id = cd.service_id
         JOIN stops s1 ON st1.stop_id = s1.stop_id
         JOIN stops s2 ON st2.stop_id = s2.stop_id
-        WHERE UPPER(s1.stop_name) = UPPER(?)
+        WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
           AND cd.date = ?
           AND cd.exception_type = 1
         ORDER BY st1.dep_min ASC
         LIMIT 500
         """
-        cursor.execute(query_direct, (start_label, date_clean))
+        cursor.execute(query_direct, (start_label, start_label, date_clean))
 
         for row in cursor.fetchall():
             dest_name = row["to_name"]
@@ -211,8 +214,8 @@ def explore_destinations(
 
 @app.get("/search")
 def search_all(
-    origin: str = Query(..., description="Nom de la gare de départ"),
-    destination: str = Query(..., description="Nom de la gare d'arrivée"),
+    origin: str = Query(..., description="Nom de la gare ou ville de départ"),
+    destination: str = Query(..., description="Nom de la gare ou ville d'arrivée"),
     date: str = Query(..., description="Date au format YYYY-MM-DD"),
     departure_time: Optional[str] = Query(
         "00:00:00", description="Heure minimale de départ (HH:MM:SS)"
@@ -230,7 +233,7 @@ def search_all(
         time_parts = list(map(int, departure_time.split(":")))
         start_min = time_parts[0] * 60 + time_parts[1]
 
-        # 1. Trajets directs
+        # 1. Trajets directs (Flexible: stop_name OU parent_name)
         query_direct = """
         SELECT DISTINCT
             s1.stop_name AS orig, s2.stop_name AS dest,
@@ -247,8 +250,8 @@ def search_all(
         JOIN calendar_dates cd ON t.service_id = cd.service_id
         JOIN stops s1 ON st1.stop_id = s1.stop_id
         JOIN stops s2 ON st2.stop_id = s2.stop_id
-        WHERE UPPER(s1.stop_name) = UPPER(?)
-          AND UPPER(s2.stop_name) = UPPER(?)
+        WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
+          AND (UPPER(s2.stop_name) = UPPER(?) OR UPPER(s2.parent_name) = UPPER(?))
           AND cd.date = ?
           AND cd.exception_type = 1
           AND st1.dep_min >= ?
@@ -257,7 +260,7 @@ def search_all(
         """
         cursor.execute(
             query_direct,
-            (orig_label, dest_label, date_clean, start_min, limit * 2),
+            (orig_label, orig_label, dest_label, dest_label, date_clean, start_min, limit * 2),
         )
         direct_rows = cursor.fetchall()
 
@@ -292,7 +295,7 @@ def search_all(
             d["train1_no"] for d in direct_results if d["train1_no"]
         }
 
-        # 2. Correspondances
+        # 2. Correspondances INTER-GARES (Mise en relation par parent_name, ex: Métropole Parisienne)
         query_connections = """
         WITH train1 AS (
             SELECT 
@@ -300,7 +303,9 @@ def search_all(
                 COALESCE(NULLIF(r1.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
                 st1_dep.departure_time AS train1_dep, st1_arr.arrival_time AS train1_arr,
                 st1_arr.dep_min AS arr_min1, st1_dep.dep_min AS dep_min1,
-                s_trans1.stop_name AS transfer_station, s_trans1.stop_lat AS transfer_lat, s_trans1.stop_lon AS transfer_lon,
+                s_trans1.stop_name AS transfer_station_arr, 
+                s_trans1.parent_name AS transfer_parent,
+                s_trans1.stop_lat AS transfer_lat, s_trans1.stop_lon AS transfer_lon,
                 s1.stop_name AS orig, s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon
             FROM stop_times st1_dep
             JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
@@ -309,12 +314,12 @@ def search_all(
             JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
             JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
             JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
-            WHERE UPPER(s1.stop_name) = UPPER(?)
+            WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
               AND cd1.date = ? 
               AND cd1.exception_type = 1
               AND st1_dep.dep_min >= ?
             ORDER BY st1_dep.dep_min ASC
-            LIMIT 40
+            LIMIT 60
         ),
         train2 AS (
             SELECT 
@@ -322,7 +327,8 @@ def search_all(
                 COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
                 st2_dep.departure_time AS train2_dep, st2_arr.arrival_time AS train2_arr,
                 st2_dep.dep_min AS dep_min2,
-                s_trans2.stop_name AS transfer_station,
+                s_trans2.stop_name AS transfer_station_dep,
+                s_trans2.parent_name AS transfer_parent,
                 s2.stop_name AS dest, s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon
             FROM stop_times st2_dep
             JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
@@ -331,28 +337,34 @@ def search_all(
             JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
             JOIN stops s_trans2 ON st2_dep.stop_id = s_trans2.stop_id
             JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
-            WHERE UPPER(s2.stop_name) = UPPER(?)
+            WHERE (UPPER(s2.stop_name) = UPPER(?) OR UPPER(s2.parent_name) = UPPER(?))
               AND cd2.date = ? 
               AND cd2.exception_type = 1
         )
         SELECT 
             t1.orig, t1.orig_lat, t1.orig_lon,
-            t1.transfer_station AS transfer_station_arr, t1.transfer_lat, t1.transfer_lon,
-            t1.transfer_station AS transfer_station_dep,
+            t1.transfer_station_arr, t1.transfer_lat, t1.transfer_lon,
+            t2.transfer_station_dep,
             t2.dest, t2.dest_lat, t2.dest_lon,
             t1.train1_no, t1.train1_type, t1.train1_dep, t1.train1_arr,
             t2.train2_no, t2.train2_type, t2.train2_dep, t2.train2_arr,
             (t2.dep_min2 - t1.arr_min1) AS layover_minutes,
             t1.dep_min1 AS dep_min
         FROM train1 t1
-        JOIN train2 t2 ON t1.transfer_station = t2.transfer_station
-        WHERE t2.dep_min2 >= (t1.arr_min1 + 15)
-          AND t2.dep_min2 <= (t1.arr_min1 + 90)
+        JOIN train2 t2 ON t1.transfer_parent = t2.transfer_parent
+        WHERE (
+            -- Si correspondance dans la MÊME gare (ex: Montparnasse -> Montparnasse) : minimum 15 min
+            (t1.transfer_station_arr = t2.transfer_station_dep AND t2.dep_min2 >= t1.arr_min1 + 15)
+            OR 
+            -- Si correspondance INTER-GARE (ex: Montparnasse -> Gare de Lyon) : minimum 40 min pour transfert métro/RER
+            (t1.transfer_station_arr != t2.transfer_station_dep AND t2.dep_min2 >= t1.arr_min1 + 40)
+        )
+        AND t2.dep_min2 <= (t1.arr_min1 + 150)
         ORDER BY t1.dep_min1 ASC
         """
         cursor.execute(
             query_connections,
-            (orig_label, date_clean, start_min, dest_label, date_clean),
+            (orig_label, orig_label, date_clean, start_min, dest_label, dest_label, date_clean),
         )
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
