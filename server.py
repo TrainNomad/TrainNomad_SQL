@@ -88,7 +88,6 @@ def get_stations(
     search_pattern = "%" + q.strip().upper() + "%"
 
     try:
-        # Recherche prioritaire par nom de gare ou nom de ville/parent
         query_stations = """
             SELECT DISTINCT stop_name, parent_name, country, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, uic
             FROM stops 
@@ -140,7 +139,7 @@ def explore_destinations(
         date_clean = date.strip()
         best_journeys = {}
 
-        # Matching flexible : correspond au nom de gare OU au nom parent
+        # 1. Trajets directs
         query_direct = """
         SELECT 
             s2.stop_name AS to_name,
@@ -199,6 +198,99 @@ def explore_destinations(
             ):
                 best_journeys[dest_name] = journey
 
+        # 2. Trajets avec correspondance (Logique dynamique TGV Max)
+        query_transfers = """
+        SELECT 
+            st1_dep.departure_time AS train1_dep,
+            st1_arr.arrival_time AS train1_arr,
+            t1.trip_headsign AS train1_no,
+            COALESCE(NULLIF(r1.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
+            s_trans1.stop_name AS transfer_arr,
+            s_trans2.stop_name AS transfer_dep,
+            s2.stop_name AS to_name,
+            s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
+            st2_dep.departure_time AS train2_dep,
+            st2_arr.arrival_time AS train2_arr,
+            t2.trip_headsign AS train2_no,
+            COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
+            st1_dep.dep_min AS start_dep,
+            st2_arr.dep_min AS end_arr,
+            (st2_dep.dep_min - st1_arr.dep_min) AS layover_minutes
+        FROM stop_times st1_dep
+        JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
+        JOIN trips t1 ON st1_dep.trip_id = t1.trip_id
+        JOIN routes r1 ON t1.route_id = r1.route_id
+        JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
+        JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
+        JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
+        JOIN stops s_trans2 ON s_trans1.parent_name = s_trans2.parent_name
+        JOIN stop_times st2_dep ON s_trans2.stop_id = st2_dep.stop_id
+        JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
+        JOIN trips t2 ON st2_dep.trip_id = t2.trip_id
+        JOIN routes r2 ON t2.route_id = r2.route_id
+        JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
+        JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
+        WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
+          AND cd1.date = ? AND cd1.exception_type = 1
+          AND cd2.date = ? AND cd2.exception_type = 1
+          AND st2_dep.dep_min >= (st1_arr.dep_min + 15)
+          AND st2_dep.dep_min <= (st1_arr.dep_min + 180)
+        ORDER BY st1_dep.dep_min ASC
+        LIMIT 500
+        """
+        cursor.execute(query_transfers, (start_label, start_label, date_clean, date_clean))
+
+        for row in cursor.fetchall():
+            dest_name = row["to_name"]
+            is_same_station = row["transfer_arr"] == row["transfer_dep"]
+            layover = row["layover_minutes"]
+
+            # Règle de correspondance TGV Max
+            is_valid = (15 <= layover <= 120) if is_same_station else (60 <= layover <= 180)
+            if not is_valid:
+                continue
+
+            duration_min = row["end_arr"] - row["start_dep"]
+            if duration_min < 0:
+                duration_min += 24 * 60
+
+            journey = {
+                "dest_name": dest_name,
+                "dest_lat": row["dest_lat"],
+                "dest_lon": row["dest_lon"],
+                "duration": duration_min,
+                "dep_str": row["train1_dep"],
+                "arr_str": row["train2_arr"],
+                "transfers": 1,
+                "legs": [
+                    {
+                        "from_name": start_label,
+                        "to_name": row["transfer_arr"],
+                        "dep_str": row["train1_dep"],
+                        "arr_str": row["train1_arr"],
+                        "train_no": row["train1_no"],
+                        "train_type": row["train1_type"],
+                        "lat": None,
+                        "lon": None,
+                    },
+                    {
+                        "from_name": row["transfer_dep"],
+                        "to_name": dest_name,
+                        "dep_str": row["train2_dep"],
+                        "arr_str": row["train2_arr"],
+                        "train_no": row["train2_no"],
+                        "train_type": row["train2_type"],
+                        "lat": row["dest_lat"],
+                        "lon": row["dest_lon"],
+                    },
+                ],
+            }
+
+            if dest_name not in best_journeys:
+                best_journeys[dest_name] = journey
+            elif best_journeys[dest_name]["transfers"] == 1 and duration_min < best_journeys[dest_name]["duration"]:
+                best_journeys[dest_name] = journey
+
         journeys = list(best_journeys.values())
         journeys.sort(key=lambda x: (x["transfers"], x["duration"]))
 
@@ -233,7 +325,7 @@ def search_all(
         time_parts = list(map(int, departure_time.split(":")))
         start_min = time_parts[0] * 60 + time_parts[1]
 
-        # 1. Trajets directs (Flexible: stop_name OU parent_name)
+        # 1. Trajets directs
         query_direct = """
         SELECT DISTINCT
             s1.stop_name AS orig, s2.stop_name AS dest,
@@ -295,7 +387,7 @@ def search_all(
             d["train1_no"] for d in direct_results if d["train1_no"]
         }
 
-        # 2. Correspondances INTER-GARES (Mise en relation par parent_name, ex: Métropole Parisienne)
+        # 2. Correspondances - Sélection élargie (15 min à 180 min)
         query_connections = """
         WITH train1 AS (
             SELECT 
@@ -352,14 +444,8 @@ def search_all(
             t1.dep_min1 AS dep_min
         FROM train1 t1
         JOIN train2 t2 ON t1.transfer_parent = t2.transfer_parent
-        WHERE (
-            -- Si correspondance dans la MÊME gare (ex: Montparnasse -> Montparnasse) : minimum 15 min
-            (t1.transfer_station_arr = t2.transfer_station_dep AND t2.dep_min2 >= t1.arr_min1 + 15)
-            OR 
-            -- Si correspondance INTER-GARE (ex: Montparnasse -> Gare de Lyon) : minimum 40 min pour transfert métro/RER
-            (t1.transfer_station_arr != t2.transfer_station_dep AND t2.dep_min2 >= t1.arr_min1 + 40)
-        )
-        AND t2.dep_min2 <= (t1.arr_min1 + 150)
+        WHERE t2.dep_min2 >= (t1.arr_min1 + 15)
+          AND t2.dep_min2 <= (t1.arr_min1 + 180)
         ORDER BY t1.dep_min1 ASC
         """
         cursor.execute(
@@ -368,7 +454,7 @@ def search_all(
         )
         conn_rows = [dict(row) for row in cursor.fetchall()]
 
-        # 3. Filtrage anti-redondance
+        # 3. Validation dynamique des fenêtres de layover (Logique TGV Max)
         valid_connections = []
         seen_first_trains = set()
 
@@ -378,11 +464,17 @@ def search_all(
             if c["train1_no"] in seen_first_trains:
                 continue
 
-            c["is_direct"] = False
-            c["date"] = date_clean
-            c["is_valid_layover"] = True
-            valid_connections.append(c)
-            seen_first_trains.add(c["train1_no"])
+            is_same_station = c["transfer_station_arr"] == c["transfer_station_dep"]
+            layover = c["layover_minutes"]
+
+            # Application des règles TGV Max : 15-120 min (même gare) vs 60-180 min (inter-gares)
+            c["is_valid_layover"] = (15 <= layover <= 120) if is_same_station else (60 <= layover <= 180)
+
+            if c["is_valid_layover"]:
+                c["is_direct"] = False
+                c["date"] = date_clean
+                valid_connections.append(c)
+                seen_first_trains.add(c["train1_no"])
 
         combined = direct_results + valid_connections
         combined.sort(key=lambda x: x["dep_min"])
