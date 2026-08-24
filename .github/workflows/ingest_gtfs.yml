@@ -1,0 +1,27 @@
+name: Ingestion Hebdomadaire GTFS API
+
+on:
+  schedule:
+    # Exécution chaque dimanche à 4h00 UTC
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+jobs:
+  download-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Récupérer le code du dépôt
+      uses: actions/checkout@v4
+
+    - name: Télécharger le fichier .db.gz
+      run: |
+        curl -L -o gtfs_indexed.db.gz "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/gtfs_indexed.db.gz"
+
+    - name: Commit et Push de gtfs_indexed.db.gz
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add gtfs_indexed.db.gz
+        git commit -m "Auto-update: Synchronisation hebdomadaire de gtfs_indexed.db.gz" || exit 0
+        git push
