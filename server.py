@@ -123,190 +123,73 @@ def get_stations(
 
 @app.get("/explorer")
 def explore_destinations_stream(
-    from_station: Optional[str] = Query(
-        None, alias="from", description="Nom de la gare de départ"
-    ),
-    origin: Optional[str] = Query(None, description="Alternative à 'from'"),
-    date: str = Query(..., description="Date au format YYYY-MM-DD"),
+    from_station: Optional[str] = Query(None, alias="from"),
+    origin: Optional[str] = Query(None),
+    date: str = Query(...),
 ):
     start_label = (from_station or origin or "").strip()
     if not start_label:
-        raise HTTPException(
-            status_code=400, detail="Paramètre 'from' ou 'origin' requis"
-        )
+        raise HTTPException(status_code=400, detail="Paramètre 'from' requis")
 
-    def event_generator():
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        date_clean = date.strip()
-        best_journeys = {}
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Requête ultra-rapide axée uniquement sur les trajets directs optimisés
+    query = """
+    SELECT 
+        s2.stop_name AS dest_name,
+        s2.stop_lat AS dest_lat, 
+        s2.stop_lon AS dest_lon,
+        st1.departure_time AS dep_str,
+        st2.arrival_time AS arr_str,
+        st1.dep_min, 
+        st2.dep_min AS arr_min,
+        t.trip_headsign AS train_no,
+        COALESCE(NULLIF(r.train_type, 'TRAIN'), 'Train SNCF') AS train_type
+    FROM stop_times st1
+    JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
+    JOIN trips t ON st1.trip_id = t.trip_id
+    JOIN routes r ON t.route_id = r.route_id
+    JOIN calendar_dates cd ON t.service_id = cd.service_id
+    JOIN stops s1 ON st1.stop_id = s1.stop_id
+    JOIN stops s2 ON st2.stop_id = s2.stop_id
+    WHERE (UPPER(s1.stop_name) LIKE UPPER(?) OR UPPER(s1.parent_name) LIKE UPPER(?))
+      AND cd.date = ?
+      AND cd.exception_type = 1
+    ORDER BY st1.dep_min ASC
+    LIMIT 200
+    """
+    
+    cursor.execute(query, (f"%{start_label}%", f"%{start_label}%", date.strip()))
+    rows = cursor.fetchall()
+    conn.close()
 
-        try:
-            # 1. Trajets directs (Envoyés en premier pour un affichage immédiat)
-            query_direct = """
-            SELECT 
-                s2.stop_name AS to_name,
-                s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-                st1.departure_time AS dep_str,
-                st2.arrival_time AS arr_str,
-                st1.dep_min, st2.dep_min AS arr_min,
-                t.trip_headsign AS train_no,
-                COALESCE(NULLIF(r.train_type, 'TRAIN'), 'Train SNCF') AS train_type
-            FROM stop_times st1
-            JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
-            JOIN trips t ON st1.trip_id = t.trip_id
-            JOIN routes r ON t.route_id = r.route_id
-            JOIN calendar_dates cd ON t.service_id = cd.service_id
-            JOIN stops s1 ON st1.stop_id = s1.stop_id
-            JOIN stops s2 ON st2.stop_id = s2.stop_id
-            WHERE (UPPER(s2.stop_name) LIKE UPPER(?) OR UPPER(s2.parent_name) LIKE UPPER(?))
-              AND cd.date = ?
-              AND cd.exception_type = 1
-            ORDER BY st1.dep_min ASC
-            LIMIT 300
-            """
-            cursor.execute(query_direct, (start_label, start_label, date_clean))
+    results = []
+    seen_destinations = set()
 
-            for row in cursor.fetchall():
-                dest_name = row["to_name"]
-                duration_min = row["arr_min"] - row["dep_min"]
-                if duration_min < 0:
-                    duration_min += 24 * 60
+    for row in rows:
+        dest_name = row["dest_name"]
+        if dest_name in seen_destinations:
+            continue
+        
+        duration_min = row["arr_min"] - row["dep_min"]
+        if duration_min < 0:
+            duration_min += 24 * 60
 
-                journey = {
-                    "dest_name": dest_name,
-                    "dest_lat": row["dest_lat"],
-                    "dest_lon": row["dest_lon"],
-                    "duration": duration_min,
-                    "dep_str": row["dep_str"],
-                    "arr_str": row["arr_str"],
-                    "transfers": 0,
-                    "legs": [
-                        {
-                            "from_name": start_label,
-                            "to_name": dest_name,
-                            "dep_str": row["dep_str"],
-                            "arr_str": row["arr_str"],
-                            "train_no": row["train_no"],
-                            "train_type": row["train_type"],
-                            "lat": row["dest_lat"],
-                            "lon": row["dest_lon"],
-                        }
-                    ],
-                }
+        seen_destinations.add(dest_name)
+        results.append({
+            "dest_name": dest_name,
+            "dest_lat": row["dest_lat"],
+            "dest_lon": row["dest_lon"],
+            "duration": duration_min,
+            "train1_dep": row["dep_str"],
+            "train2_arr": row["arr_str"],
+            "transfers": 0,
+            "train1_no": row["train_no"],
+            "train1_type": row["train_type"]
+        })
 
-                if (
-                    dest_name not in best_journeys
-                    or duration_min < best_journeys[dest_name]["duration"]
-                ):
-                    best_journeys[dest_name] = journey
-                    # Yield immédiat du trajet direct trouvé
-                    yield f"data: {json.dumps(journey)}\n\n"
-
-            # 2. Trajets avec correspondance (Traitement flux par flux)
-            query_transfers = """
-            SELECT 
-                st1_dep.departure_time AS train1_dep,
-                st1_arr.arrival_time AS train1_arr,
-                t1.trip_headsign AS train1_no,
-                COALESCE(NULLIF(r1.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
-                s_trans1.stop_name AS transfer_arr,
-                s_trans2.stop_name AS transfer_dep,
-                s2.stop_name AS to_name,
-                s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon,
-                st2_dep.departure_time AS train2_dep,
-                st2_arr.arrival_time AS train2_arr,
-                t2.trip_headsign AS train2_no,
-                COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
-                st1_dep.dep_min AS start_dep,
-                st2_arr.dep_min AS end_arr,
-                (st2_dep.dep_min - st1_arr.dep_min) AS layover_minutes
-            FROM stop_times st1_dep
-            JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
-            JOIN trips t1 ON st1_dep.trip_id = t1.trip_id
-            JOIN routes r1 ON t1.route_id = r1.route_id
-            JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
-            JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
-            JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
-            JOIN stops s_trans2 ON s_trans1.parent_name = s_trans2.parent_name
-            JOIN stop_times st2_dep ON s_trans2.stop_id = st2_dep.stop_id
-            JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
-            JOIN trips t2 ON st2_dep.trip_id = t2.trip_id
-            JOIN routes r2 ON t2.route_id = r2.route_id
-            JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
-            JOIN stops s2 ON st2_arr.stop_id = s2.stop_id
-            WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
-              AND cd1.date = ? AND cd1.exception_type = 1
-              AND cd2.date = ? AND cd2.exception_type = 1
-              AND st2_dep.dep_min >= (st1_arr.dep_min + 15)
-              AND st2_dep.dep_min <= (st1_arr.dep_min + 180)
-            ORDER BY st1_dep.dep_min ASC
-            LIMIT 300
-            """
-            cursor.execute(query_transfers, (start_label, start_label, date_clean, date_clean))
-
-            for row in cursor.fetchall():
-                dest_name = row["to_name"]
-                is_same_station = row["transfer_arr"] == row["transfer_dep"]
-                layover = row["layover_minutes"]
-
-                is_valid = (15 <= layover <= 120) if is_same_station else (60 <= layover <= 180)
-                if not is_valid:
-                    continue
-
-                duration_min = row["end_arr"] - row["start_dep"]
-                if duration_min < 0:
-                    duration_min += 24 * 60
-
-                journey = {
-                    "dest_name": dest_name,
-                    "dest_lat": row["dest_lat"],
-                    "dest_lon": row["dest_lon"],
-                    "duration": duration_min,
-                    "dep_str": row["train1_dep"],
-                    "arr_str": row["train2_arr"],
-                    "transfers": 1,
-                    "legs": [
-                        {
-                            "from_name": start_label,
-                            "to_name": row["transfer_arr"],
-                            "dep_str": row["train1_dep"],
-                            "arr_str": row["train1_arr"],
-                            "train_no": row["train1_no"],
-                            "train_type": row["train1_type"],
-                            "lat": None,
-                            "lon": None,
-                        },
-                        {
-                            "from_name": row["transfer_dep"],
-                            "to_name": dest_name,
-                            "dep_str": row["train2_dep"],
-                            "arr_str": row["train2_arr"],
-                            "train_no": row["train2_no"],
-                            "train_type": row["train2_type"],
-                            "lat": row["dest_lat"],
-                            "lon": row["dest_lon"],
-                        },
-                    ],
-                }
-
-                if dest_name not in best_journeys:
-                    best_journeys[dest_name] = journey
-                    yield f"data: {json.dumps(journey)}\n\n"
-                elif best_journeys[dest_name]["transfers"] == 1 and duration_min < best_journeys[dest_name]["duration"]:
-                    best_journeys[dest_name] = journey
-                    yield f"data: {json.dumps(journey)}\n\n"
-
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        finally:
-            conn.close()
-            # Message de fin de flux
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
+    return results
 @app.get("/search")
 def search_all(
     origin: str = Query(..., description="Nom de la gare ou ville de départ"),
