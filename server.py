@@ -6,14 +6,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import json
-from fastapi.responses import StreamingResponse
 
 
 app = FastAPI(
     title="SNCF Multi-Transport API",
-    description="API optimisée GTFS SQLite avec gestion des correspondances multi-gares par métropole.",
-    version="2.2.0",
+    description="API optimisée GTFS SQLite avec gestion des correspondances multiples et filtrage de pertinence.",
+    version="2.3.0",
 )
 
 app.add_middleware(
@@ -57,7 +55,6 @@ def startup_event():
 
 @app.get("/health")
 def health_check():
-    """Endpoint de diagnostic."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -134,7 +131,6 @@ def explore_destinations_stream(
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Requête ultra-rapide axée uniquement sur les trajets directs optimisés
     query = """
     SELECT 
         s2.stop_name AS dest_name,
@@ -190,6 +186,14 @@ def explore_destinations_stream(
         })
 
     return results
+
+
+def parse_time_to_min(time_str: str) -> int:
+    """Convertit une chaîne HH:MM:SS en minutes depuis minuit."""
+    parts = list(map(int, time_str.split(":")))
+    return parts[0] * 60 + parts[1]
+
+
 @app.get("/search")
 def search_all(
     origin: str = Query(..., description="Nom de la gare ou ville de départ"),
@@ -198,7 +202,7 @@ def search_all(
     departure_time: Optional[str] = Query(
         "00:00:00", description="Heure minimale de départ (HH:MM:SS)"
     ),
-    limit: int = Query(6, description="Nombre de trajets à retourner"),
+    limit: int = Query(10, description="Nombre de trajets à retourner"),
 ):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -207,11 +211,11 @@ def search_all(
         date_clean = date.strip()
         orig_label = origin.strip()
         dest_label = destination.strip()
+        start_min = parse_time_to_min(departure_time)
 
-        time_parts = list(map(int, departure_time.split(":")))
-        start_min = time_parts[0] * 60 + time_parts[1]
-
-        # 1. Trajets directs
+        # ==========================================
+        # 1. Trajets Directs (0 correspondance)
+        # ==========================================
         query_direct = """
         SELECT DISTINCT
             s1.stop_name AS orig, s2.stop_name AS dest,
@@ -220,7 +224,7 @@ def search_all(
             st1.departure_time AS train1_dep, st2.arrival_time AS train1_arr,
             t.trip_headsign AS train1_no,
             COALESCE(NULLIF(r.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
-            st1.dep_min
+            st1.dep_min AS dep_min, st2.dep_min AS arr_min
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id AND st1.stop_sequence < st2.stop_sequence
         JOIN trips t ON st1.trip_id = t.trip_id
@@ -242,9 +246,17 @@ def search_all(
         )
         direct_rows = cursor.fetchall()
 
-        direct_results = [
-            {
+        direct_results = []
+        direct_train_numbers = set()
+
+        for d in direct_rows:
+            dur = d["arr_min"] - d["dep_min"]
+            if dur < 0:
+                dur += 24 * 60
+
+            direct_results.append({
                 "is_direct": True,
+                "transfers_count": 0,
                 "orig": d["orig"],
                 "dest": d["dest"],
                 "orig_lat": d["orig_lat"],
@@ -263,18 +275,24 @@ def search_all(
                 "train2_dep": None,
                 "train2_arr": None,
                 "layover_minutes": 0,
-                "is_valid_layover": True,
+                "transfer_station_2_arr": None,
+                "transfer_station_2_dep": None,
+                "train3_no": None,
+                "train3_type": None,
+                "train3_dep": None,
+                "train3_arr": None,
+                "layover_minutes_2": 0,
+                "total_duration_min": dur,
                 "dep_min": d["dep_min"],
-            }
-            for d in direct_rows
-        ]
+                "arr_min": d["arr_min"],
+            })
+            if d["train1_no"]:
+                direct_train_numbers.add(d["train1_no"])
 
-        direct_train_numbers = {
-            d["train1_no"] for d in direct_results if d["train1_no"]
-        }
-
-        # 2. Correspondances - Sélection élargie (15 min à 180 min)
-        query_connections = """
+        # ==========================================
+        # 2. Correspondances - 1 Escale (2 trains)
+        # ==========================================
+        query_conn_1 = """
         WITH train1 AS (
             SELECT 
                 t1.trip_headsign AS train1_no,
@@ -296,15 +314,14 @@ def search_all(
               AND cd1.date = ? 
               AND cd1.exception_type = 1
               AND st1_dep.dep_min >= ?
-            ORDER BY st1_dep.dep_min ASC
-            LIMIT 500
+            LIMIT 300
         ),
         train2 AS (
             SELECT 
                 t2.trip_headsign AS train2_no,
                 COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
                 st2_dep.departure_time AS train2_dep, st2_arr.arrival_time AS train2_arr,
-                st2_dep.dep_min AS dep_min2,
+                st2_dep.dep_min AS dep_min2, st2_arr.dep_min AS arr_min2,
                 s_trans2.stop_name AS transfer_station_dep,
                 s_trans2.parent_name AS transfer_parent,
                 s2.stop_name AS dest, s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon
@@ -327,43 +344,230 @@ def search_all(
             t1.train1_no, t1.train1_type, t1.train1_dep, t1.train1_arr,
             t2.train2_no, t2.train2_type, t2.train2_dep, t2.train2_arr,
             (t2.dep_min2 - t1.arr_min1) AS layover_minutes,
-            t1.dep_min1 AS dep_min
+            t1.dep_min1 AS dep_min, t2.arr_min2 AS arr_min
         FROM train1 t1
         JOIN train2 t2 ON t1.transfer_parent = t2.transfer_parent
-        WHERE t2.dep_min2 >= (t1.arr_min1 + 15)
-          AND t2.dep_min2 <= (t1.arr_min1 + 180)
+        WHERE t2.dep_min2 >= (t1.arr_min1 + 12)
+          AND t2.dep_min2 <= (t1.arr_min1 + 150)
         ORDER BY t1.dep_min1 ASC
+        LIMIT 200
         """
         cursor.execute(
-            query_connections,
+            query_conn_1,
             (orig_label, orig_label, date_clean, start_min, dest_label, dest_label, date_clean),
         )
-        conn_rows = [dict(row) for row in cursor.fetchall()]
+        conn_1_rows = [dict(row) for row in cursor.fetchall()]
 
-        # 3. Validation dynamique des fenêtres de layover (Logique TGV Max)
+        # ==========================================
+        # 3. Correspondances - 2 Escales (3 trains)
+        # ==========================================
+        query_conn_2 = """
+        WITH train1 AS (
+            SELECT 
+                t1.trip_headsign AS train1_no,
+                COALESCE(NULLIF(r1.train_type, 'TRAIN'), 'Train SNCF') AS train1_type,
+                st1_dep.departure_time AS train1_dep, st1_arr.arrival_time AS train1_arr,
+                st1_arr.dep_min AS arr_min1, st1_dep.dep_min AS dep_min1,
+                s_trans1.stop_name AS transfer1_arr, s_trans1.parent_name AS trans1_parent,
+                s1.stop_name AS orig, s1.stop_lat AS orig_lat, s1.stop_lon AS orig_lon
+            FROM stop_times st1_dep
+            JOIN stop_times st1_arr ON st1_dep.trip_id = st1_arr.trip_id AND st1_dep.stop_sequence < st1_arr.stop_sequence
+            JOIN trips t1 ON st1_dep.trip_id = t1.trip_id
+            JOIN routes r1 ON t1.route_id = r1.route_id
+            JOIN calendar_dates cd1 ON t1.service_id = cd1.service_id
+            JOIN stops s1 ON st1_dep.stop_id = s1.stop_id
+            JOIN stops s_trans1 ON st1_arr.stop_id = s_trans1.stop_id
+            WHERE (UPPER(s1.stop_name) = UPPER(?) OR UPPER(s1.parent_name) = UPPER(?))
+              AND cd1.date = ? AND cd1.exception_type = 1
+              AND st1_dep.dep_min >= ?
+            LIMIT 150
+        ),
+        train2 AS (
+            SELECT 
+                t2.trip_headsign AS train2_no,
+                COALESCE(NULLIF(r2.train_type, 'TRAIN'), 'Train SNCF') AS train2_type,
+                st2_dep.departure_time AS train2_dep, st2_arr.arrival_time AS train2_arr,
+                st2_dep.dep_min AS dep_min2, st2_arr.dep_min AS arr_min2,
+                s_trans2_dep.stop_name AS transfer1_dep, s_trans2_dep.parent_name AS trans1_parent,
+                s_trans2_arr.stop_name AS transfer2_arr, s_trans2_arr.parent_name AS trans2_parent
+            FROM stop_times st2_dep
+            JOIN stop_times st2_arr ON st2_dep.trip_id = st2_arr.trip_id AND st2_dep.stop_sequence < st2_arr.stop_sequence
+            JOIN trips t2 ON st2_dep.trip_id = t2.trip_id
+            JOIN routes r2 ON t2.route_id = r2.route_id
+            JOIN calendar_dates cd2 ON t2.service_id = cd2.service_id
+            JOIN stops s_trans2_dep ON st2_dep.stop_id = s_trans2_dep.stop_id
+            JOIN stops s_trans2_arr ON st2_arr.stop_id = s_trans2_arr.stop_id
+            WHERE cd2.date = ? AND cd2.exception_type = 1
+            LIMIT 300
+        ),
+        train3 AS (
+            SELECT 
+                t3.trip_headsign AS train3_no,
+                COALESCE(NULLIF(r3.train_type, 'TRAIN'), 'Train SNCF') AS train3_type,
+                st3_dep.departure_time AS train3_dep, st3_arr.arrival_time AS train3_arr,
+                st3_dep.dep_min AS dep_min3, st3_arr.dep_min AS arr_min3,
+                s_trans3.stop_name AS transfer2_dep, s_trans3.parent_name AS trans2_parent,
+                s2.stop_name AS dest, s2.stop_lat AS dest_lat, s2.stop_lon AS dest_lon
+            FROM stop_times st3_dep
+            JOIN stop_times st3_arr ON st3_dep.trip_id = st3_arr.trip_id AND st3_dep.stop_sequence < st3_arr.stop_sequence
+            JOIN trips t3 ON st3_dep.trip_id = t3.trip_id
+            JOIN routes r3 ON t3.route_id = r3.route_id
+            JOIN calendar_dates cd3 ON t3.service_id = cd3.service_id
+            JOIN stops s_trans3 ON st3_dep.stop_id = s_trans3.stop_id
+            JOIN stops s2 ON st3_arr.stop_id = s2.stop_id
+            WHERE (UPPER(s2.stop_name) = UPPER(?) OR UPPER(s2.parent_name) = UPPER(?))
+              AND cd3.date = ? AND cd3.exception_type = 1
+            LIMIT 150
+        )
+        SELECT 
+            t1.orig, t1.orig_lat, t1.orig_lon,
+            t1.transfer1_arr AS transfer_station_arr, t2.transfer1_dep AS transfer_station_dep,
+            t2.transfer2_arr AS transfer_station_2_arr, t3.transfer2_dep AS transfer_station_2_dep,
+            t3.dest, t3.dest_lat, t3.dest_lon,
+            t1.train1_no, t1.train1_type, t1.train1_dep, t1.train1_arr,
+            t2.train2_no, t2.train2_type, t2.train2_dep, t2.train2_arr,
+            t3.train3_no, t3.train3_type, t3.train3_dep, t3.train3_arr,
+            (t2.dep_min2 - t1.arr_min1) AS layover_minutes,
+            (t3.dep_min3 - t2.arr_min2) AS layover_minutes_2,
+            t1.dep_min1 AS dep_min, t3.arr_min3 AS arr_min
+        FROM train1 t1
+        JOIN train2 t2 ON t1.trans1_parent = t2.trans1_parent
+        JOIN train3 t3 ON t2.trans2_parent = t3.trans2_parent
+        WHERE t2.dep_min2 >= (t1.arr_min1 + 12) AND t2.dep_min2 <= (t1.arr_min1 + 120)
+          AND t3.dep_min3 >= (t2.arr_min2 + 12) AND t3.dep_min3 <= (t2.arr_min2 + 120)
+        ORDER BY t1.dep_min1 ASC
+        LIMIT 100
+        """
+        cursor.execute(
+            query_conn_2,
+            (orig_label, orig_label, date_clean, start_min, date_clean, dest_label, dest_label, date_clean),
+        )
+        conn_2_rows = [dict(row) for row in cursor.fetchall()]
+
+        # ==========================================
+        # 4. Traitement, Filtrage & Déduplication
+        # ==========================================
         valid_connections = []
-        seen_first_trains = set()
+        seen_route_signatures = set()
 
-        for c in conn_rows:
+        # Filtrage 1 correspondance
+        for c in conn_1_rows:
             if c["train1_no"] in direct_train_numbers:
-                continue
-            if c["train1_no"] in seen_first_trains:
                 continue
 
             is_same_station = c["transfer_station_arr"] == c["transfer_station_dep"]
             layover = c["layover_minutes"]
+            is_valid = (12 <= layover <= 120) if is_same_station else (45 <= layover <= 180)
 
-            # Application des règles TGV Max : 15-120 min (même gare) vs 60-180 min (inter-gares)
-            c["is_valid_layover"] = (15 <= layover <= 120) if is_same_station else (60 <= layover <= 180)
+            if not is_valid:
+                continue
 
-            if c["is_valid_layover"]:
-                c["is_direct"] = False
-                c["date"] = date_clean
-                valid_connections.append(c)
-                seen_first_trains.add(c["train1_no"])
+            tot_duration = c["arr_min"] - c["dep_min"]
+            if tot_duration < 0:
+                tot_duration += 24 * 60
 
+            # Signature unique pour éviter d'afficher le même trajet à quelques secondes près
+            signature = f"{c['train1_dep']}_{c['train1_no']}_{c['transfer_station_arr']}_{c['train2_no']}"
+            if signature in seen_route_signatures:
+                continue
+            seen_route_signatures.add(signature)
+
+            valid_connections.append({
+                "is_direct": False,
+                "transfers_count": 1,
+                "orig": c["orig"],
+                "dest": c["dest"],
+                "orig_lat": c["orig_lat"],
+                "orig_lon": c["orig_lon"],
+                "dest_lat": c["dest_lat"],
+                "dest_lon": c["dest_lon"],
+                "date": date_clean,
+                "train1_no": c["train1_no"],
+                "train1_type": c["train1_type"],
+                "train1_dep": c["train1_dep"],
+                "train1_arr": c["train1_arr"],
+                "transfer_station_arr": c["transfer_station_arr"],
+                "transfer_station_dep": c["transfer_station_dep"],
+                "train2_no": c["train2_no"],
+                "train2_type": c["train2_type"],
+                "train2_dep": c["train2_dep"],
+                "train2_arr": c["train2_arr"],
+                "layover_minutes": layover,
+                "transfer_station_2_arr": None,
+                "transfer_station_2_dep": None,
+                "train3_no": None,
+                "train3_type": None,
+                "train3_dep": None,
+                "train3_arr": None,
+                "layover_minutes_2": 0,
+                "total_duration_min": tot_duration,
+                "dep_min": c["dep_min"],
+                "arr_min": c["arr_min"],
+            })
+
+        # Filtrage 2 correspondances
+        for c in conn_2_rows:
+            if c["train1_no"] in direct_train_numbers:
+                continue
+
+            is_same_1 = c["transfer_station_arr"] == c["transfer_station_dep"]
+            is_same_2 = c["transfer_station_2_arr"] == c["transfer_station_2_dep"]
+
+            valid_1 = (12 <= c["layover_minutes"] <= 120) if is_same_1 else (45 <= c["layover_minutes"] <= 180)
+            valid_2 = (12 <= c["layover_minutes_2"] <= 120) if is_same_2 else (45 <= c["layover_minutes_2"] <= 180)
+
+            if not (valid_1 and valid_2):
+                continue
+
+            tot_duration = c["arr_min"] - c["dep_min"]
+            if tot_duration < 0:
+                tot_duration += 24 * 60
+
+            signature = f"{c['train1_dep']}_{c['train1_no']}_{c['transfer_station_arr']}_{c['train2_no']}_{c['transfer_station_2_arr']}_{c['train3_no']}"
+            if signature in seen_route_signatures:
+                continue
+            seen_route_signatures.add(signature)
+
+            valid_connections.append({
+                "is_direct": False,
+                "transfers_count": 2,
+                "orig": c["orig"],
+                "dest": c["dest"],
+                "orig_lat": c["orig_lat"],
+                "orig_lon": c["orig_lon"],
+                "dest_lat": c["dest_lat"],
+                "dest_lon": c["dest_lon"],
+                "date": date_clean,
+                "train1_no": c["train1_no"],
+                "train1_type": c["train1_type"],
+                "train1_dep": c["train1_dep"],
+                "train1_arr": c["train1_arr"],
+                "transfer_station_arr": c["transfer_station_arr"],
+                "transfer_station_dep": c["transfer_station_dep"],
+                "train2_no": c["train2_no"],
+                "train2_type": c["train2_type"],
+                "train2_dep": c["train2_dep"],
+                "train2_arr": c["train2_arr"],
+                "layover_minutes": c["layover_minutes"],
+                "transfer_station_2_arr": c["transfer_station_2_arr"],
+                "transfer_station_2_dep": c["transfer_station_2_dep"],
+                "train3_no": c["train3_no"],
+                "train3_type": c["train3_type"],
+                "train3_dep": c["train3_dep"],
+                "train3_arr": c["train3_arr"],
+                "layover_minutes_2": c["layover_minutes_2"],
+                "total_duration_min": tot_duration,
+                "dep_min": c["dep_min"],
+                "arr_min": c["arr_min"],
+            })
+
+        # ==========================================
+        # 5. Fusion et Tri par Pertinence
+        # ==========================================
         combined = direct_results + valid_connections
-        combined.sort(key=lambda x: x["dep_min"])
+
+        # Tri : Heure de départ > Nombre de correspondances > Durée totale
+        combined.sort(key=lambda x: (x["dep_min"], x["transfers_count"], x["total_duration_min"]))
 
         page_results = combined[:limit]
 
@@ -376,8 +580,10 @@ def search_all(
             ).time()
             next_cursor = str(next_time)
 
+        # Nettoyage des clés internes
         for r in page_results:
             r.pop("dep_min", None)
+            r.pop("arr_min", None)
 
         conn.close()
         return {
