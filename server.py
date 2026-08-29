@@ -73,51 +73,69 @@ def health_check():
         )
 
 
+# -------------------------------------------------------------------
+# 2. AUTOCOMPLÉTION DES GARES ET VILLES
+# -------------------------------------------------------------------
 @app.get("/stations")
-def get_stations(
-    q: Optional[str] = Query(
-        None, description="Recherche partielle du nom de gare ou de ville"
-    ),
-    limit: int = Query(15, description="Limite de résultats"),
-):
-    if not q or not q.strip():
-        return {"results": []}
+def get_stations(q: str = Query(None, description="Recherche partielle de gare ou ville")): #[cite: 11]
+    """Retourne la liste des métropoles et gares correspondant au terme tapé"""
+    if not q or not q.strip(): #[cite: 11]
+        return {"results": []} #[cite: 11]
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    search_pattern = "%" + q.strip().upper() + "%"
+    conn = get_db_connection() #[cite: 11]
+    cursor = conn.cursor() #[cite: 11]
+    search_pattern = q.strip().upper() + "%" #[cite: 11]
 
     try:
+        # Recherche par métropole (parent station)[cite: 11]
+        query_cities = """
+            SELECT DISTINCT origin_parent_name AS name, origin_parent_id AS id 
+            FROM trips 
+            WHERE UPPER(origin_parent_name) LIKE ?
+            ORDER BY name ASC
+            LIMIT 5
+        """ #[cite: 11]
+        cursor.execute(query_cities, (search_pattern,)) #[cite: 11]
+        cities = [
+            {
+                "type": "city", #[cite: 11]
+                "label": row["name"], #[cite: 11]
+                "id": row["id"], #[cite: 11]
+                "country": "France", # Alimente le sous-titre de la ville en JS
+                "search_val": f"{row['name']} (toutes les gares)", #[cite: 11]
+            }
+            for row in cursor.fetchall() #[cite: 11]
+        ]
+
+        # Recherche par gare spécifique[cite: 11]
         query_stations = """
-            SELECT DISTINCT stop_name, parent_name, country, AVG(stop_lat) as stop_lat, AVG(stop_lon) as stop_lon, uic
-            FROM stops 
-            WHERE UPPER(stop_name) LIKE ? OR UPPER(parent_name) LIKE ?
-            GROUP BY stop_name
-            ORDER BY stop_name ASC
-            LIMIT ?
-        """
-        cursor.execute(query_stations, (search_pattern, search_pattern, limit))
+            SELECT DISTINCT origin_name AS name, origin_parent_name AS parent, origin_id AS id 
+            FROM trips 
+            WHERE UPPER(origin_name) LIKE ?
+            ORDER BY name ASC
+            LIMIT 10
+        """ #[cite: 11]
+        cursor.execute(query_stations, (search_pattern,)) #[cite: 11]
         stations = [
             {
-                "type": "station",
-                "label": row["stop_name"],
-                "parent_name": row["parent_name"],
-                "country": row["country"],
-                "uic": row["uic"],
-                "lat": row["stop_lat"],
-                "lon": row["stop_lon"],
+                "type": "station", #[cite: 11]
+                "label": row["name"], #[cite: 11]
+                "city": row["parent"],  # Remplacé 'parent' par 'city' pour matcher le frontend
+                "id": row["id"], #[cite: 11]
+                "search_val": row["name"], #[cite: 11]
             }
-            for row in cursor.fetchall()
+            for row in cursor.fetchall() #[cite: 11]
         ]
-        conn.close()
-        return {"results": stations}
+
+        conn.close() #[cite: 11]
+        
+        # Concaténation : Villes en premier (Niveau 1), gares associées en dessous (Niveau 2)
+        return {"results": cities + stations} #[cite: 11]
+
     except Exception as e:
-        conn.close()
-        raise HTTPException(
-            status_code=500, detail=f"Erreur autocomplétion: {str(e)}"
-        )
-
-
+        conn.close() #[cite: 11]
+        raise HTTPException(status_code=500, detail=f"Erreur autocomplétion: {str(e)}") #[cite: 11]
+    
 @app.get("/explorer")
 def explore_destinations_stream(
     from_station: Optional[str] = Query(None, alias="from"),
