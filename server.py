@@ -72,70 +72,69 @@ def health_check():
             status_code=500, detail=f"Erreur vérification BDD: {str(e)}"
         )
 
-
 # -------------------------------------------------------------------
-# 2. AUTOCOMPLÉTION DES GARES ET VILLES
+# 2. AUTOCOMPLÉTION BASÉE UNIQUEMENT SUR PARENT_NAME
 # -------------------------------------------------------------------
 @app.get("/stations")
-def get_stations(q: str = Query(None, description="Recherche partielle de gare ou ville")): #[cite: 11]
-    """Retourne la liste des métropoles et gares correspondant au terme tapé"""
-    if not q or not q.strip(): #[cite: 11]
-        return {"results": []} #[cite: 11]
+def get_stations(q: str = Query(None, description="Recherche par parent_name")):
+    if not q or not q.strip():
+        return {"results": []}
 
-    conn = get_db_connection() #[cite: 11]
-    cursor = conn.cursor() #[cite: 11]
-    search_pattern = q.strip().upper() + "%" #[cite: 11]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    search_pattern = q.strip().upper() + "%"
 
     try:
-        # Recherche par métropole (parent station)[cite: 11]
-        query_cities = """
-            SELECT DISTINCT origin_parent_name AS name, origin_parent_id AS id 
-            FROM trips 
-            WHERE UPPER(origin_parent_name) LIKE ?
-            ORDER BY name ASC
-            LIMIT 5
-        """ #[cite: 11]
-        cursor.execute(query_cities, (search_pattern,)) #[cite: 11]
-        cities = [
-            {
-                "type": "city", #[cite: 11]
-                "label": row["name"], #[cite: 11]
-                "id": row["id"], #[cite: 11]
-                "country": "France", # Alimente le sous-titre de la ville en JS
-                "search_val": f"{row['name']} (toutes les gares)", #[cite: 11]
-            }
-            for row in cursor.fetchall() #[cite: 11]
-        ]
+        # Recherche uniquement sur parent_name dans la table stops
+        query = """
+            SELECT DISTINCT 
+                parent_name AS city_name, 
+                stop_name, 
+                country 
+            FROM stops 
+            WHERE UPPER(parent_name) LIKE ?
+            ORDER BY parent_name ASC, stop_name ASC
+            LIMIT 15
+        """
+        cursor.execute(query, (search_pattern,))
+        rows = cursor.fetchall()
 
-        # Recherche par gare spécifique[cite: 11]
-        query_stations = """
-            SELECT DISTINCT origin_name AS name, origin_parent_name AS parent, origin_id AS id 
-            FROM trips 
-            WHERE UPPER(origin_name) LIKE ?
-            ORDER BY name ASC
-            LIMIT 10
-        """ #[cite: 11]
-        cursor.execute(query_stations, (search_pattern,)) #[cite: 11]
-        stations = [
-            {
-                "type": "station", #[cite: 11]
-                "label": row["name"], #[cite: 11]
-                "city": row["parent"],  # Remplacé 'parent' par 'city' pour matcher le frontend
-                "id": row["id"], #[cite: 11]
-                "search_val": row["name"], #[cite: 11]
-            }
-            for row in cursor.fetchall() #[cite: 11]
-        ]
+        # Organisation des données (Métropole -> Gares associées)
+        cities_map = {}
+        stations_list = []
 
-        conn.close() #[cite: 11]
-        
-        # Concaténation : Villes en premier (Niveau 1), gares associées en dessous (Niveau 2)
-        return {"results": cities + stations} #[cite: 11]
+        for row in rows:
+            city = row["city_name"]
+            country = row["country"]
+            station = row["stop_name"]
+
+            # Ajout unique de la ville (Niveau 1)
+            if city not in cities_map:
+                cities_map[city] = {
+                    "type": "city",
+                    "label": city,
+                    "country": country or "",
+                    "search_val": f"{city} (toutes les gares)"
+                }
+
+            # Ajout des gares rattachées (Niveau 2)
+            stations_list.append({
+                "type": "station",
+                "label": station,
+                "city": city,
+                "search_val": station
+            })
+
+        conn.close()
+
+        # Concaténation : la liste unique des villes puis les gares rattachées
+        results = list(cities_map.values()) + stations_list
+        return {"results": results}
 
     except Exception as e:
-        conn.close() #[cite: 11]
-        raise HTTPException(status_code=500, detail=f"Erreur autocomplétion: {str(e)}") #[cite: 11]
-    
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Erreur autocomplétion: {str(e)}")
+ 
 @app.get("/explorer")
 def explore_destinations_stream(
     from_station: Optional[str] = Query(None, alias="from"),
