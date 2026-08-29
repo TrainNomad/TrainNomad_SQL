@@ -76,16 +76,15 @@ def health_check():
 # 2. AUTOCOMPLÉTION BASÉE UNIQUEMENT SUR PARENT_NAME
 # -------------------------------------------------------------------
 @app.get("/stations")
-def get_stations(q: str = Query(None, description="Recherche par parent_name")):
-    if not q or not q.strip():
-        return {"results": []}
+def get_stations(q: str = Query(None, description="Recherche par parent_name")): #
+    if not q or not q.strip(): #
+        return {"results": []} 
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    search_pattern = q.strip().upper() + "%"
+    conn = get_db_connection() 
+    cursor = conn.cursor() 
+    search_pattern = q.strip().upper() + "%" 
 
     try:
-        # Recherche uniquement sur parent_name dans la table stops
         query = """
             SELECT DISTINCT 
                 parent_name AS city_name, 
@@ -95,11 +94,10 @@ def get_stations(q: str = Query(None, description="Recherche par parent_name")):
             WHERE UPPER(parent_name) LIKE ?
             ORDER BY parent_name ASC, stop_name ASC
             LIMIT 15
-        """
-        cursor.execute(query, (search_pattern,))
-        rows = cursor.fetchall()
+        """ 
+        cursor.execute(query, (search_pattern,)) 
+        rows = cursor.fetchall() 
 
-        # Organisation des données (Métropole -> Gares associées)
         cities_map = {}
         stations_list = []
 
@@ -108,31 +106,29 @@ def get_stations(q: str = Query(None, description="Recherche par parent_name")):
             country = row["country"]
             station = row["stop_name"]
 
-            # Ajout unique de la ville (Niveau 1)
             if city not in cities_map:
                 cities_map[city] = {
                     "type": "city",
                     "label": city,
                     "country": country or "",
-                    "search_val": f"{city} (toutes les gares)"
+                    # On envoie uniquement le nom propre de la métropole
+                    "search_val": city 
                 }
 
-            # Ajout des gares rattachées (Niveau 2)
             stations_list.append({
                 "type": "station",
                 "label": station,
                 "city": city,
-                "search_val": station
+                "search_val": station 
             })
 
-        conn.close()
+        conn.close() 
 
-        # Concaténation : la liste unique des villes puis les gares rattachées
-        results = list(cities_map.values()) + stations_list
-        return {"results": results}
+        results = list(cities_map.values()) + stations_list 
+        return {"results": results} 
 
     except Exception as e:
-        conn.close()
+        conn.close() 
         raise HTTPException(status_code=500, detail=f"Erreur autocomplétion: {str(e)}")
  
 @app.get("/explorer")
