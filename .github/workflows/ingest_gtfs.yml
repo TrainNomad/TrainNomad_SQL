@@ -2,7 +2,7 @@ name: Ingestion Hebdomadaire GTFS API
 
 on:
   schedule:
-    # Exécution chaque dimanche à 4h00 UTC
+    # Exécution chaque dimanche à 4h00 UTC (après la compilation du dépôt TrainNomad_GTFS à 3h00)
     - cron: '0 4 * * 0'
   workflow_dispatch:
 
@@ -14,14 +14,20 @@ jobs:
     - name: Récupérer le code du dépôt
       uses: actions/checkout@v4
 
-    - name: Télécharger le fichier .db.gz
+    - name: Télécharger le réseau compilé (API Go)
       run: |
-        curl -L -o gtfs_indexed.db.gz "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/gtfs_indexed.db.gz"
+        curl -fL -o network.bin.gz "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/network.bin.gz"
 
-    - name: Commit et Push de gtfs_indexed.db.gz
+    # Ancienne base SQLite (API FastAPI) : à supprimer une fois l'API Go en production.
+    - name: Télécharger le fichier .db.gz (ancienne API)
+      continue-on-error: true
+      run: |
+        curl -fL -o gtfs_indexed.db.gz "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/gtfs_indexed.db.gz"
+
+    - name: Commit et Push (Render redéploie automatiquement)
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add gtfs_indexed.db.gz
-        git commit -m "Auto-update: Synchronisation hebdomadaire de gtfs_indexed.db.gz" || exit 0
+        git add network.bin.gz gtfs_indexed.db.gz
+        git commit -m "Auto-update: Synchronisation hebdomadaire du réseau GTFS" || exit 0
         git push

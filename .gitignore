@@ -1,4 +1,7 @@
 !gtfs_indexed.db.gz
+!network.bin.gz
 __pycache__/
 gtfs_indexed.db
-
+network.bin
+*.exe
+*.test
