@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/api .
 FROM scratch
 COPY --from=build /out/api /api
 COPY network.bin.gz /network.bin.gz
-# Render (offre gratuite) : 0,1 CPU -> un seul thread d'exécution Go évite la contention.
-ENV NETWORK_PATH=/network.bin.gz GOMAXPROCS=1
-EXPOSE 8000
+# Fly.io : utilise le port 8080 (défini dans fly.toml)
+ENV NETWORK_PATH=/network.bin.gz GOMAXPROCS=1 PORT=8080
+EXPOSE 8080
 ENTRYPOINT ["/api"]
