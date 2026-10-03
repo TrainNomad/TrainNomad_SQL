@@ -1,0 +1,56 @@
+name: Publier l'API
+
+# Compile l'API Europe pour le serveur (Linux x86) et la publie dans la Release GitHub « api-latest ».
+# Le serveur vérifie cette Release toutes les 5 minutes, installe la nouvelle version et redémarre
+# l'API (Backend/serveur/maj/trainnomad-update) : aucun accès SSH depuis GitHub, aucun secret.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.go"
+      - go.mod
+      - .github/workflows/release-api.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-api
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: api-latest
+  RELEASE_TITLE: API Europe (dernière version)
+  FILES: api
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vérifier
+        run: go vet ./... # pas de go test : le module s'appelle « main », que go test ne sait pas importer
+
+      - name: Compiler pour Linux x86
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o api .
+
+      - name: Publier dans la Release api-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum $FILES > SHA256SUMS
+          NOTES="Compilée le $(date -u +%Y-%m-%dT%H:%M:%SZ) à partir de ${GITHUB_SHA::7} (run ${{ github.run_id }}). Installée automatiquement par le serveur : ne pas supprimer."
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "$RELEASE_TITLE" --notes "$NOTES" --latest=false
+          fi
+          gh release upload "$RELEASE_TAG" $FILES --clobber
+          # En dernier : c'est ce fichier que le serveur surveille, il ne doit changer qu'une fois le reste en place
+          gh release upload "$RELEASE_TAG" SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" --notes "$NOTES"

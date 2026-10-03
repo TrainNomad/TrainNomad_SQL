@@ -145,6 +145,24 @@ func LoadNetwork(path string) (*Network, error) {
 	return parseNetwork(raw)
 }
 
+// LoadNetworkBytes : comme LoadNetwork, depuis un contenu déjà en mémoire (gzip ou non),
+// par exemple téléchargé depuis la Release GitHub (cf. reload.go).
+func LoadNetworkBytes(data []byte) (*Network, error) {
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		gz, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer gz.Close()
+		raw, err := io.ReadAll(gz)
+		if err != nil {
+			return nil, err
+		}
+		return parseNetwork(raw)
+	}
+	return parseNetwork(data)
+}
+
 func parseNetwork(raw []byte) (*Network, error) {
 	if len(raw) < 16 || !bytes.Equal(raw[:8], []byte("TNNET001")) {
 		return nil, fmt.Errorf("format network.bin inconnu")

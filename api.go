@@ -60,6 +60,7 @@ type Journey struct {
 	To          StopRef  `json:"to"`
 	Operators   []string `json:"operators"`
 	TrainTypes  []string `json:"train_types"`
+	HighSpeed   bool     `json:"high_speed"` // au moins un train à grande vitesse (TGV, OUIGO, ICE, AVE...)
 	Legs        []Leg    `json:"legs"`
 }
 
@@ -71,19 +72,27 @@ type apiError struct {
 
 func fmtTime(t time.Time) string { return t.Format("2006-01-02T15:04:05-07:00") }
 
+// Server : instantané du réseau pour une requête (le réseau peut être remplacé à chaud entre deux requêtes).
 type Server struct {
-	e       *Engine
-	started time.Time
-	loadMs  int64
+	e   *Engine
+	st  *netState
+	app *App
 }
 
-func (s *Server) routes() http.Handler {
+func (a *App) routes() http.Handler {
+	h := func(fn func(*Server, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			st := a.cur.Load()
+			fn(&Server{e: st.e, st: st, app: a}, w, r)
+		}
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleRoot)
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/stations", s.handleStations)
-	mux.HandleFunc("/search", s.handleSearch)
-	mux.HandleFunc("/explorer", s.handleExplorer)
+	mux.HandleFunc("/", h((*Server).handleRoot))
+	mux.HandleFunc("/health", h((*Server).handleHealth))
+	mux.HandleFunc("/stations", h((*Server).handleStations))
+	mux.HandleFunc("/search", h((*Server).handleSearch))
+	mux.HandleFunc("/explorer", h((*Server).handleExplorer))
+	mux.HandleFunc("/reload", a.handleReload)
 	return withMiddleware(mux)
 }
 
@@ -163,8 +172,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"stops":      n.NumStops(),
 		"routes":     n.NumRoutes(),
 		"trips":      len(n.TripDays),
-		"load_ms":    s.loadMs,
-		"uptime_s":   int(time.Since(s.started).Seconds()),
+		"load_ms":    s.st.loadMs,
+		"uptime_s":   int(time.Since(s.app.started).Seconds()),
+		"network":    s.app.status(),
 		"memory_mb":  map[string]float64{"heap": float64(m.HeapAlloc) / 1e6, "sys": float64(m.Sys) / 1e6},
 		"build":      n.Meta.Stats,
 	})
@@ -247,7 +257,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	maxTransfers := intParam(r, "max_transfers", 6, 0, 8)
 
 	start := time.Now()
-	raw := s.e.Search(from, to, day, s.minutes(t), limit, maxTransfers)
+	variants := param(r, "variants") != "0" // alternatives sans grande vitesse (TER, Intercités)
+	raw := s.e.Search(from, to, day, s.minutes(t), limit, maxTransfers, variants)
 	elapsed := time.Since(start)
 
 	journeys := make([]Journey, 0, limit)
@@ -317,7 +328,7 @@ func (s *Server) stopRef(p int32) StopRef {
 
 func (s *Server) toJourney(dt *DayTable, j rawJourney) Journey {
 	n := s.e.Net
-	out := Journey{DurationMin: j.arr - j.dep, Transfers: j.trains - 1, Operators: []string{}, TrainTypes: []string{}}
+	out := Journey{DurationMin: j.arr - j.dep, Transfers: j.trains - 1, Operators: []string{}, TrainTypes: []string{}, HighSpeed: s.e.isFast(dt, j)}
 	seenOp, seenType := map[string]bool{}, map[string]bool{}
 	var ids []string
 

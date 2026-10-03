@@ -2,10 +2,18 @@ package main
 
 import "container/heap"
 
-// buildLowerBoundGraph : pour chaque paire d'arrêts consécutifs d'une route, le temps de parcours
-// minimal (tous trajets confondus), plus les correspondances à pied. Stocké à l'envers (CSR par
-// gare d'arrivée) pour un Dijkstra depuis la destination.
-func (n *Network) buildLowerBoundGraph() {
+// lbGraph : pour chaque paire d'arrêts consécutifs d'une route, le temps de parcours minimal,
+// plus les correspondances à pied. Stocké à l'envers (CSR par gare d'arrivée) pour un Dijkstra
+// depuis la destination.
+type lbGraph struct {
+	off  []uint32
+	from []int32
+	min  []int32
+}
+
+// newLBGraph construit le graphe des minorants en ignorant les trains dont le type est exclu
+// (nil = tous les trains).
+func (n *Network) newLBGraph(exclude []bool) *lbGraph {
 	best := map[[2]int32]int32{}
 	add := func(u, v, w int32) {
 		k := [2]int32{u, v}
@@ -20,12 +28,17 @@ func (n *Network) buildLowerBoundGraph() {
 		for i := 0; i+1 < S; i++ {
 			m := int32(1 << 30)
 			for t := t0; t < t1; t++ {
+				if exclude != nil && exclude[n.TripType[t]] {
+					continue
+				}
 				k := n.RouteTimeOff[r] + (t-t0)*uint32(S)
 				if d := int32(n.TimeArr[k+uint32(i+1)]) - int32(n.TimeDep[k+uint32(i)]); d < m {
 					m = d
 				}
 			}
-			add(stops[i], stops[i+1], max(m, 0))
+			if m < 1<<30 {
+				add(stops[i], stops[i+1], max(m, 0))
+			}
 		}
 	}
 	for u := int32(0); u < int32(n.NumStops()); u++ {
@@ -35,27 +48,35 @@ func (n *Network) buildLowerBoundGraph() {
 	}
 
 	ns := n.NumStops()
-	n.lbOff = make([]uint32, ns+1)
+	g := &lbGraph{off: make([]uint32, ns+1), from: make([]int32, len(best)), min: make([]int32, len(best))}
 	for k := range best {
-		n.lbOff[k[1]+1]++
+		g.off[k[1]+1]++
 	}
 	for i := 1; i <= ns; i++ {
-		n.lbOff[i] += n.lbOff[i-1]
+		g.off[i] += g.off[i-1]
 	}
-	fill := append([]uint32(nil), n.lbOff[:ns]...)
-	n.lbFrom = make([]int32, len(best))
-	n.lbMin = make([]int32, len(best))
+	fill := append([]uint32(nil), g.off[:ns]...)
 	for k, w := range best {
 		v := k[1]
-		n.lbFrom[fill[v]] = k[0]
-		n.lbMin[fill[v]] = w
+		g.from[fill[v]] = k[0]
+		g.min[fill[v]] = w
 		fill[v]++
 	}
+	return g
+}
+
+func (n *Network) buildLowerBoundGraph() {
+	g := n.newLBGraph(nil)
+	n.lbOff, n.lbFrom, n.lbMin = g.off, g.from, g.min
 }
 
 // lowerBounds renvoie, pour chaque gare, un minorant du temps de trajet jusqu'à l'une des cibles
 // (inf si la cible est inatteignable).
 func (n *Network) lowerBounds(targets []int32) []int32 {
+	return n.boundsOn(&lbGraph{n.lbOff, n.lbFrom, n.lbMin}, targets)
+}
+
+func (n *Network) boundsOn(g *lbGraph, targets []int32) []int32 {
 	dist := make([]int32, n.NumStops())
 	for i := range dist {
 		dist[i] = inf
@@ -70,9 +91,9 @@ func (n *Network) lowerBounds(targets []int32) []int32 {
 		if it.d > dist[it.stop] {
 			continue
 		}
-		for e := n.lbOff[it.stop]; e < n.lbOff[it.stop+1]; e++ {
-			u := n.lbFrom[e]
-			if d := it.d + n.lbMin[e]; d < dist[u] {
+		for e := g.off[it.stop]; e < g.off[it.stop+1]; e++ {
+			u := g.from[e]
+			if d := it.d + g.min[e]; d < dist[u] {
 				dist[u] = d
 				heap.Push(h, distItem{u, d})
 			}

@@ -108,6 +108,28 @@ func (dt *DayTable) earliest(r int32, S, i int, t int32) int {
 	return best
 }
 
+// allowed : l'instance q de la route r n'est pas d'un type de train exclu.
+func (dt *DayTable) allowed(n *Network, r int32, q int, exclude []bool) bool {
+	return exclude == nil || !exclude[n.TripType[dt.InstTrip[dt.InstOff[r]+uint32(q)]]]
+}
+
+// earliestAllowed : comme earliest, en sautant les trains d'un type exclu.
+func (dt *DayTable) earliestAllowed(n *Network, r int32, S, i int, t int32, exclude []bool) int {
+	q := dt.earliest(r, S, i, t)
+	if exclude == nil || q < 0 || dt.allowed(n, r, q, exclude) {
+		return q
+	}
+	off := dt.TimeOff[r]
+	best, bestT := -1, int32(0)
+	for q := 0; q < dt.numInst(r); q++ {
+		d := dt.Dep[off+uint32(q*S+i)]
+		if d >= t && (best < 0 || d < bestT) && dt.allowed(n, r, q, exclude) {
+			best, bestT = q, d
+		}
+	}
+	return best
+}
+
 // tableCache garde les DayTable des dernières dates interrogées (≈ 5 Mo chacune).
 type tableCache struct {
 	mu    sync.Mutex

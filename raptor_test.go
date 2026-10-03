@@ -32,7 +32,7 @@ func searchAt(tb testing.TB, e *Engine, from, to string, date string, hh, mm, li
 	loc := e.Net.Locations[e.Net.StopTZ[f.stops[0]]]
 	d, _ := time.ParseInLocation("2006-01-02", date, loc)
 	start := time.Date(d.Year(), d.Month(), d.Day(), hh, mm, 0, 0, loc)
-	return e.Search(f, t, e.Net.DayIndex(d), int32(start.Sub(e.Net.BaseDate)/time.Minute), limit, 6)
+	return e.Search(f, t, e.Net.DayIndex(d), int32(start.Sub(e.Net.BaseDate)/time.Minute), limit, 6, true)
 }
 
 func testDate(e *Engine) string { return e.Net.FirstDate().AddDate(0, 0, 7).Format("2006-01-02") }

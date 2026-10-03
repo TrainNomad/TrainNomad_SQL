@@ -24,7 +24,9 @@ jobs:
       run: |
         curl -fL -o gtfs_indexed.db.gz "https://raw.githubusercontent.com/TrainNomad/TrainNomad_GTFS/main/gtfs_indexed.db.gz"
 
-    - name: Commit et Push (Render redéploie automatiquement)
+    # Garde à jour le réseau de secours embarqué dans l'image (sans redéployer : cf. buildFilter de
+    # render.yaml). L'API en ligne, elle, lit la Release network-latest du dépôt TrainNomad_GTFS.
+    - name: Commit et Push du réseau de secours
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"

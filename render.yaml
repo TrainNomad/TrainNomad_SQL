@@ -5,3 +5,18 @@ services:
     plan: free
     healthCheckPath: /health
     autoDeploy: true
+    # Seul un changement de code redéploie (et consomme des minutes de build). Le réseau, lui, est
+    # téléchargé au démarrage depuis la Release GitHub et rechargé à chaud (POST /reload) : les
+    # mises à jour hebdomadaires des données ne déclenchent plus de build.
+    buildFilter:
+      paths:
+        - "*.go"
+        - go.mod
+        - Dockerfile
+        - render.yaml
+    envVars:
+      - key: NETWORK_URL
+        value: https://github.com/TrainNomad/TrainNomad_GTFS/releases/download/network-latest/network.bin.gz
+      # Même valeur que le secret RELOAD_TOKEN du dépôt TrainNomad_GTFS : à saisir dans le tableau de bord
+      - key: RELOAD_TOKEN
+        sync: false

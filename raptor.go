@@ -33,6 +33,8 @@ type rawLeg struct {
 type rawJourney struct {
 	dep, arr int32
 	trains   int
+	fast     bool // emprunte un train à grande vitesse (cf. Engine.fastTypes)
+	longWait bool // attente de plus de maxTransferWait en correspondance (nuit en gare)
 	legs     []rawLeg
 }
 
@@ -44,20 +46,19 @@ type rangeQuery struct {
 	maxRounds   int
 	maxDuration int32   // minutes ; 0 = illimité
 	lb          []int32 // minorant du temps restant jusqu'à la destination (nil = pas d'élagage)
-	minDur      *int32  // durée du trajet le plus rapide trouvé (partagée entre tranches), cf. relevanceLimit
+	exclude     []bool  // types de train (index Meta.Types) interdits ; nil = tous autorisés
 	onJourney   func(rawJourney)
 	onArrival   func(k int, stop int32, arr, dep int32) // exploration : chaque amélioration d'arrivée
 }
 
 type raptorState struct {
-	K        int
-	q        *rangeQuery
-	tau      int32
-	durLimit int32     // durée au-delà de laquelle un trajet ne serait pas pertinent
-	arr      [][]int32 // [tour][gare] arrivée en train
-	ready    [][]int32 // [tour][gare] prêt à monter dans un train (après changement ou marche)
-	leg      [][]legRef
-	from     [][]int32 // origine de ready : -1 = départ, la gare elle-même = changement sur place, sinon marche
+	K     int
+	q     *rangeQuery
+	tau   int32
+	arr   [][]int32 // [tour][gare] arrivée en train
+	ready [][]int32 // [tour][gare] prêt à monter dans un train (après changement ou marche)
+	leg   [][]legRef
+	from  [][]int32 // origine de ready : -1 = départ, la gare elle-même = changement sur place, sinon marche
 
 	marked, improved     []int32
 	isMarked, isImproved []bool
@@ -191,7 +192,7 @@ func departures(n *Network, dt *DayTable, q *rangeQuery) []depEvent {
 			off := dt.TimeOff[r]
 			for qi := 0; qi < dt.numInst(r); qi++ {
 				d := dt.Dep[off+uint32(qi*S+i)]
-				if d >= q.tStart && d < q.tEnd {
+				if d >= q.tStart && d < q.tEnd && dt.allowed(n, r, qi, q.exclude) {
 					ev = append(ev, depEvent{d, s, r, int32(qi), int32(i)})
 				}
 			}
@@ -208,10 +209,6 @@ func runRaptor(n *Network, dt *DayTable, q *rangeQuery) {
 	for gi := 0; gi < len(events); {
 		tau := events[gi].t
 		st.tau = tau
-		st.durLimit = inf
-		if q.minDur != nil && *q.minDur != inf {
-			st.durLimit = relevanceLimit(*q.minDur)
-		}
 		for k := range st.targetIter {
 			st.targetIter[k] = false
 		}
@@ -258,9 +255,6 @@ func runRaptor(n *Network, dt *DayTable, q *rangeQuery) {
 			for k := 1; k <= K; k++ {
 				if st.targetIter[k] {
 					if j, ok := st.reconstruct(n, dt, k, st.targetStop[k], tau); ok {
-						if q.minDur != nil && j.arr-j.dep < *q.minDur {
-							*q.minDur = j.arr - j.dep
-						}
 						q.onJourney(j)
 					}
 				}
@@ -294,7 +288,7 @@ func (st *raptorState) relax(k int, p int32, v int32, from int32) {
 	if st.q.maxDuration > 0 && v-st.tau > st.q.maxDuration {
 		return
 	}
-	if st.q.lb != nil && (st.q.lb[p] == inf || v+st.q.lb[p] >= st.targetBound(k+1) || v+st.q.lb[p]-st.tau > st.durLimit) {
+	if st.q.lb != nil && (st.q.lb[p] == inf || v+st.q.lb[p] >= st.targetBound(k+1)) {
 		return
 	}
 	st.ready[k][p] = v
@@ -311,7 +305,7 @@ func (st *raptorState) arrive(k int, p int32, a int32, l legRef) {
 		return
 	}
 	// élagage : même au mieux, on n'arriverait pas avant le meilleur trajet connu
-	if st.q.lb != nil && (st.q.lb[p] == inf || a+st.q.lb[p] >= st.targetBound(k) || a+st.q.lb[p]-st.tau > st.durLimit) {
+	if st.q.lb != nil && (st.q.lb[p] == inf || a+st.q.lb[p] >= st.targetBound(k)) {
 		return
 	}
 	st.arr[k][p] = a
@@ -368,7 +362,7 @@ func (st *raptorState) scanRoute(n *Network, dt *DayTable, r int32, i0, k int) {
 		if cur >= 0 && need > dt.Dep[off+uint32(cur*S+i)] {
 			continue
 		}
-		if qn := dt.earliest(r, S, i, need); qn >= 0 {
+		if qn := dt.earliestAllowed(n, r, S, i, need, st.q.exclude); qn >= 0 {
 			if cur < 0 || dt.Dep[off+uint32(qn*S+i)] < dt.Dep[off+uint32(cur*S+i)] {
 				cur, board = qn, i
 			}
