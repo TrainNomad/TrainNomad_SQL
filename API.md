@@ -13,7 +13,7 @@ Utiliser de préférence l'`id` renvoyé par `/stations`. Un nom (« Paris », �
 
 ## `GET /stations?q=par&limit=10`
 
-Autocomplétion (sans accents, préfixe du nom ou d'un mot). Les villes à plusieurs gares sont proposées en premier.
+Autocomplétion (sans accents, préfixe du nom ou d'un mot). Les villes à plusieurs gares sont proposées en premier. Chaque ville est suivie de ses gares (8 au plus, les plus fréquentées d'abord), même si leur nom ne contient pas la recherche : « rennes » renvoie la ville Rennes, puis les gares Rennes et Pontchaillou.
 
 ```json
 { "results": [

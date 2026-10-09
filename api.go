@@ -183,7 +183,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStations(w http.ResponseWriter, r *http.Request) {
 	q := param(r, "q")
 	limit := intParam(r, "limit", 10, 1, 50)
-	res := s.e.Places.Search(q, limit)
+	res := s.e.Places.Autocomplete(q, limit)
 	if res == nil {
 		res = []*Place{}
 	}

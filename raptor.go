@@ -281,8 +281,10 @@ func (st *raptorState) relaxTransfers(n *Network, k int) {
 }
 
 func (st *raptorState) relax(k int, p int32, v int32, from int32) {
-	// revenir dans une gare de départ ne sert à rien : il suffisait d'en partir plus tard
-	if st.isOrigin[p] || v >= st.bestReady(k, p) || v >= st.targetBound(k+1) {
+	// revenir dans une gare de départ ne sert à rien : il suffisait d'en partir plus tard.
+	// On ne reprend pas non plus de train dans une gare d'arrivée (sinon, pour une gare rejointe en
+	// métro : Paris Austerlitz -> Les Aubrais -> Paris Austerlitz, juste pour y arriver en train).
+	if st.isOrigin[p] || st.isTarget[p] || v >= st.bestReady(k, p) || v >= st.targetBound(k+1) {
 		return
 	}
 	if st.q.maxDuration > 0 && v-st.tau > st.q.maxDuration {

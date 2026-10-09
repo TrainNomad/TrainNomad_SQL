@@ -30,6 +30,7 @@ type placeEntry struct {
 
 type PlaceIndex struct {
 	byID    map[string]*Place
+	byStop  []*Place // gare de chaque arrêt du réseau
 	entries []placeEntry
 }
 
@@ -63,7 +64,7 @@ func normalize(s string) string {
 }
 
 func NewPlaceIndex(n *Network) *PlaceIndex {
-	ix := &PlaceIndex{byID: map[string]*Place{}}
+	ix := &PlaceIndex{byID: map[string]*Place{}, byStop: make([]*Place, len(n.StopID))}
 	add := func(p *Place) {
 		ix.byID[p.ID] = p
 		norm := normalize(p.Name)
@@ -81,11 +82,18 @@ func NewPlaceIndex(n *Network) *PlaceIndex {
 	}
 	for s := range n.StopID {
 		c := n.StopCity[s]
-		add(&Place{
+		p := &Place{
 			Type: "station", ID: "station:" + n.StopID[s], Name: n.StopName[s], City: n.CityName[c],
 			Country: n.StopCountry[s], Lat: n.StopLat[s], Lon: n.StopLon[s],
 			stops: []int32{int32(s)}, weight: n.StopWeight[s],
-		})
+		}
+		ix.byStop[s] = p
+		add(p)
+		// seule gare de sa ville, sous un autre nom : trouvable aussi par le nom de la ville
+		// (« saint aubin des landes » -> gare Les Lacs)
+		if norm := normalize(n.CityName[c]); len(n.CityStops[c]) == 1 && norm != "" && norm != normalize(p.Name) {
+			ix.entries = append(ix.entries, placeEntry{norm, strings.Fields(norm), p})
+		}
 	}
 	return ix
 }
@@ -143,11 +151,56 @@ func (ix *PlaceIndex) Search(q string, limit int) []*Place {
 		return hits[a].p.weight > hits[b].p.weight
 	})
 	out := make([]*Place, 0, limit)
+	seen := map[*Place]bool{} // une gare peut correspondre par son nom et par celui de sa ville
 	for _, h := range hits {
 		if len(out) == limit {
 			break
 		}
-		out = append(out, h.p)
+		if !seen[h.p] {
+			seen[h.p] = true
+			out = append(out, h.p)
+		}
+	}
+	return out
+}
+
+// maxCityStations : nombre de gares listées sous une ville dans l'autocomplétion.
+const maxCityStations = 8
+
+// Autocomplete : comme Search, mais chaque ville est suivie de ses gares (les plus fréquentées
+// d'abord), y compris celles dont le nom ne contient pas la requête (« rennes » -> Rennes, puis
+// Rennes et Pontchaillou). Une gare dont la ville est proposée n'apparaît que sous sa ville.
+func (ix *PlaceIndex) Autocomplete(q string, limit int) []*Place {
+	hits := ix.Search(q, limit)
+	children := map[*Place][]*Place{}
+	listed := map[*Place]bool{}
+	for _, p := range hits {
+		if p.Type != "city" {
+			continue
+		}
+		stations := make([]*Place, 0, len(p.stops))
+		for _, s := range p.stops {
+			stations = append(stations, ix.byStop[s])
+		}
+		sort.SliceStable(stations, func(a, b int) bool { return stations[a].weight > stations[b].weight })
+		for _, st := range stations {
+			listed[st] = true
+		}
+		if len(stations) > maxCityStations {
+			stations = stations[:maxCityStations]
+		}
+		children[p] = stations
+	}
+	out := make([]*Place, 0, limit)
+	for _, p := range hits {
+		if listed[p] {
+			continue
+		}
+		out = append(out, p)
+		out = append(out, children[p]...)
+	}
+	if len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }

@@ -24,12 +24,21 @@ type Engine struct {
 	exploreOrder []string
 }
 
-// fastTypeNames : noms de Meta.Types considérés comme grande vitesse.
+// fastTypeNames : noms de Meta.Types considérés comme grande vitesse (types de gtfs/build_network.py,
+// préfixés par la compagnie ; les anciens noms sans préfixe restent pour les réseaux déjà compilés).
+// « SNCF OUIGO Train Classique » n'y figure pas : train lent et bon marché, à ne pas écarter.
 var fastTypeNames = map[string]bool{
+	"SNCF TGV INOUI": true, "SNCF OUIGO": true, "SNCF TGV Lyria": true,
+	"Renfe AVE": true, "Renfe AVE International": true, "Renfe Avlo": true, "Renfe Alvia": true,
+	"Renfe Avant": true, "Renfe Avant Exprés": true, "Renfe Euromed": true,
+	"Trenitalia Frecciarossa": true, "Trenitalia Frecciargento": true, "Trenitalia Frecciabianca": true,
+	"Italo Train": true, "CP Alfa Pendular": true, "SBB TGV Thalys": true, "SBB RailJet": true,
 	"TGV INOUI": true, "OUIGO": true, "TGV Lyria": true, "TGV Thalys": true, "ICE": true, "Eurostar": true,
 	"AVE": true, "AVE International": true, "Avlo": true, "Alvia": true, "Avant": true, "Avant Exprés": true,
 	"Euromed": true, "Ouigo España": true, "Frecciarossa": true, "Frecciargento": true, "Frecciabianca": true,
-	"Italo": true, "Alfa Pendular": true, "RailJet": true,
+	"Italo": true, "Alfa Pendular": true, "RailJet": true, "SNCB ICE": true, "DB SNCF en coopération": true,
+	"DB ICE": true, "NS ICE": true, "ÖBB ICE": true, "SBB ICE": true,
+	"ÖBB Railjet": true, "ČD Railjet": true, "MÁV Railjet": true, "DSB Railjet": true, "ZSSK Railjet": true,
 }
 
 func NewEngine(n *Network) *Engine {
